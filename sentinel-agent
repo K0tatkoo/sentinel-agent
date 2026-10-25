@@ -1629,10 +1629,13 @@ def all_checks(cfg, refresh=True, dash=None):
     if spec:
         results += dashboard_checks(spec, snap)
 
+    specs = check_control_specs(cfg)
     for r in results:
         verbs, container, hints = check_control(cfg, r["key"])
+        unit = (specs.get(r["key"]) or {}).get("unit")
         r["controls"] = verbs
         r["container"] = container
+        r["unit"] = unit if isinstance(unit, str) and unit in cfg["units"] else None
         r["hints"] = hints
     return results
 

@@ -206,8 +206,8 @@ It adds `checks` (as in `checks`, refreshing stale ones), so a background check 
   of these is an outage, so none of them is an alert.
 - **`controls`** are the verbs `check` accepts for this key, `[]` when control is off.
   `container` names the watched container the check runs in: that container is never stopped or
-  restarted bare, only through the check. `hints` holds one plain sentence per verb, shown while
-  it runs.
+  restarted bare, only through the check. `unit` names the watched unit that runs it (for its
+  logs). `hints` holds one plain sentence per verb, shown while it runs.
 - **`checked`** is when the result was taken. Results are reused for `checks_interval_s` (60 s by
   default).
 
