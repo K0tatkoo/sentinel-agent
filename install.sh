@@ -125,8 +125,16 @@ if [[ $UNINSTALL -eq 1 ]]; then
   for u in "$TARGET_USER" sentinel; do
     if id "$u" >/dev/null 2>&1; then
       if is_dedicated "$u"; then
-        userdel -r "$u" 2>/dev/null || userdel "$u"
-        ok "removed the account $u"
+        # A phone that was just connected can leave the account a process or
+        # two (its session, systemd --user); userdel refuses while they live.
+        loginctl terminate-user "$u" >/dev/null 2>&1 || true
+        pkill -KILL -u "$u" >/dev/null 2>&1 || true
+        sleep 1
+        if userdel -r "$u" 2>/dev/null || userdel "$u" 2>/dev/null; then
+          ok "removed the account $u"
+        else
+          warn "could not remove the account $u yet (still in use): run 'userdel -r $u' in a moment"
+        fi
       else
         h="$(home_of "$u")"; [[ -n $h ]] && rm -rf "$h/.cache/sentinel-agent"
       fi
@@ -293,7 +301,7 @@ PY
 echo
 ok "done. The server's identity, to compare with what the app shows:"
 for f in /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ecdsa_key.pub; do
-  [[ -f $f ]] && ssh-keygen -lf "$f" | awk '{print "      " $2 "  (" $NF ")"}'
+  [[ -f $f ]] && ssh-keygen -lf "$f" | awk '{print "      " $2 "  " $NF}'
 done
 echo
 exit 0
