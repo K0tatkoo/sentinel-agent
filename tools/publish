@@ -1,0 +1,69 @@
+#!/bin/bash
+#
+# tools/publish — release the agent at the VERSION in sentinel-agent.
+#
+#   tools/publish
+#
+# Runs the tests, builds dist/install.sh, dates the CHANGELOG entry, commits
+# "Release vX.Y.Z", tags it, and copies install.sh + SHA256SUMS to the site
+# that serves them (web/nebula3d/public/sentinel/<version>/, or $SITE).
+# Afterwards, by hand:
+#   git push --atomic origin main vX.Y.Z      this repo (public: published at once)
+#   commit + push the site                     its push deploys the files
+#   AgentRelease.swift in the app              the version and the printed checksum
+#
+# A published version never changes: the app carries its checksum, so a
+# different file under the same path would make every install fail. To fix
+# anything, bump VERSION.
+# Written for the macOS /bin/bash (3.2).
+
+set -euo pipefail
+die() { printf '\n  ✗ %s\n\n' "$*" >&2; exit 1; }
+say() { printf '  %s\n' "$*"; }
+
+cd "$(dirname "$0")/.."
+VERSION="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' sentinel-agent)"
+[ -n "$VERSION" ] || die "no VERSION line in sentinel-agent"
+SITE="${SITE:-../../web/nebula3d/public/sentinel}"
+[ -d "$(dirname "$SITE")" ] || die "the site's public folder is not at $(dirname "$SITE") (set SITE)"
+[ "$(git branch --show-current)" = main ] || die "publish from main"
+[ -z "$(git status --porcelain)" ] || die "commit or stash your changes first"
+
+python3 -m unittest discover -s tests -q 2>&1 | tail -1
+tools/build >/dev/null
+SUM="$(cut -d' ' -f1 dist/SHA256SUMS)"
+
+DEST="$SITE/$VERSION"
+if [ -d "$DEST" ]; then
+  cmp -s dist/install.sh "$DEST/install.sh" \
+    || die "$VERSION is already published with a different installer — bump VERSION"
+  say "$VERSION is already on the site, unchanged"
+else
+  mkdir -p "$DEST"
+  cp dist/install.sh dist/SHA256SUMS "$DEST/"
+  say "copied install.sh + SHA256SUMS to $DEST"
+fi
+
+if grep -q "^## $VERSION — unreleased" CHANGELOG.md; then
+  sed -i '' "s/^## $VERSION — unreleased/## $VERSION — $(date +%Y-%m-%d)/" CHANGELOG.md
+  git commit -q -m "Release v$VERSION" CHANGELOG.md
+  say "dated the CHANGELOG and committed Release v$VERSION"
+fi
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+  [ "$(git rev-parse "v$VERSION^{commit}")" = "$(git rev-parse HEAD)" ] \
+    || die "tag v$VERSION exists on another commit"
+else
+  git tag -a "v$VERSION" -m "Sentinel agent $VERSION"
+  say "tagged v$VERSION"
+fi
+
+cat <<EOF
+
+  ✓ agent $VERSION, installer sha256 $SUM
+
+  next:
+    git push --atomic origin main v$VERSION
+    the site: commit public/sentinel/$VERSION and push (it deploys)
+    the app:  AgentRelease.version = "$VERSION", sha256 = "$SUM"
+
+EOF

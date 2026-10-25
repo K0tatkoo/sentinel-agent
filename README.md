@@ -24,8 +24,12 @@ The app shows the exact command, with its own key and the installer's checksum f
 on the server (or from a computer, wrapped in `ssh -t you@server '…'`):
 
 ```bash
-f=$(mktemp) && curl -fsSL https://n3d-store.com/sentinel/2.0.0/install.sh -o "$f" && echo "<sha256>  $f" | sha256sum -c --quiet - && sudo bash "$f" --key <key>
+f=$(mktemp) && { curl -fsSL https://n3d-store.com/sentinel/2.0.0/install.sh -o "$f" || wget -qO "$f" https://n3d-store.com/sentinel/2.0.0/install.sh; } && echo "<sha256>  $f" | sha256sum -c --quiet - && $([ "$(id -u)" = 0 ] || echo sudo) bash "$f" --key <key>
 ```
+
+Each release's checksum is also published next to it
+([`SHA256SUMS`](https://n3d-store.com/sentinel/2.0.0/SHA256SUMS)), and `dist/install.sh` is what
+`tools/build` makes from this repository at the release's tag. A published version never changes.
 
 Or download it yourself, read it, and run it:
 
@@ -157,6 +161,7 @@ key lines.
 ```bash
 python3 -m unittest discover -s tests -v   # no root, no network, no Docker needed
 tools/build                                # dist/install.sh with the agent inside, and its SHA256SUMS
+tools/publish                              # test, build, tag vX.Y.Z and put it on the site
 ```
 
 [PROTOCOL.md](PROTOCOL.md) is the contract with the app.
