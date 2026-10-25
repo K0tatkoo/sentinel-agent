@@ -1,0 +1,7 @@
+01-Inlet Ambient  | 01h | ok  | 39.1 | 22 degrees C
+02-CPU 1         | 02h | ok  | 65.1 | 40 degrees C
+03-CPU 2         | 03h | ok  | 65.2 | 42 degrees C
+Fan 1            | 29h | ok  | 29.1 | 23.52 percent
+Power Supply 1   | 40h | ok  | 10.1 | 145 Watts
+Power Supply 2   | 41h | ok  | 10.2 | 130 Watts
+Power Meter      | 42h | ok  |  7.1 | 275 Watts

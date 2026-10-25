@@ -1,0 +1,1 @@
+{"smartctl": {"exit_status": 0}, "device": {"name": "/dev/bus/0", "info_name": "/dev/bus/0 [megaraid_disk_00]", "type": "megaraid,0", "protocol": "SCSI"}, "scsi_model_name": "SEAGATE ST900MM0006", "smart_status": {"passed": true}, "temperature": {"current": 31}, "power_on_time": {"hours": 61410}, "scsi_grown_defect_list": 0}

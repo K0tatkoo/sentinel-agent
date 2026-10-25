@@ -1,0 +1,3 @@
+/dev/disk1 / apfs rw 0 0
+tmpfs /run tmpfs rw 0 0
+/dev/loop0 /snap/core squashfs ro 0 0

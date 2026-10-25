@@ -1,0 +1,5 @@
+/dev/sda -d sat # /dev/sda [SAT], ATA device
+/dev/nvme0 -d nvme # /dev/nvme0, NVMe device
+/dev/bus/0 -d megaraid,0 # /dev/bus/0 [megaraid_disk_00], SCSI device
+/dev/bus/0 -d megaraid,1 # /dev/bus/0 [megaraid_disk_01], SCSI device
+# /dev/sdc -d usbjmicron # /dev/sdc [USB JMicron], ATA device open failed: Operation not supported

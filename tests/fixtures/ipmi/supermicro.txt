@@ -1,0 +1,8 @@
+CPU Temp         | 01h | ok  |  3.1 | 38 degrees C
+System Temp      | 0Bh | ok  |  7.1 | 30 degrees C
+Peripheral Temp  | 0Ch | nc  |  7.1 | 61 degrees C
+FAN1             | 41h | ok  | 29.1 | 1800 RPM
+FAN2             | 42h | cr  | 29.2 | 0 RPM
+FANA             | 45h | ns  | 29.5 | No Reading
+PS1 Status       | C8h | ok  | 10.1 | Presence detected
+PS2 Status       | C9h | ok  | 10.2 | Presence detected, Failure detected

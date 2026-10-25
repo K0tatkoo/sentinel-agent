@@ -1,0 +1,2377 @@
+#!/usr/bin/env python3
+"""
+sentinel-agent — the only program a Sentinel phone key is permitted to run.
+
+Installed as a forced command in the watching account's ~/.ssh/authorized_keys:
+
+    restrict,command="/usr/local/bin/sentinel-agent" ssh-ed25519 AAAA... sentinel-iphone
+
+so a key that reaches this file cannot open a shell, forward a port or run
+anything else. The request arrives in $SSH_ORIGINAL_COMMAND, is split with
+shlex and held to a whitelist; it is never handed to a shell. Losing the phone
+therefore costs a view of this server and the controls its owner allowed, not
+the server.
+
+Every request prints one JSON object on one line and exits 0. Failures are
+reported inside it ({"ok": false, "error": ...}) rather than by exit status,
+because the app has to render something either way. PROTOCOL.md is the
+contract.
+
+What it reads, and from where:
+
+  * /proc and /sys for the host itself, read here on every call. CPU and
+    network figures are rates, and a rate needs two samples: the previous one
+    is cached between calls, and when it is missing or stale a second sample is
+    taken inline — never a since-boot average, which looks live and never moves.
+  * systemd for the watched services, Docker for the watched containers.
+  * Hardware from up to four sources, each optional: the kernel's own sensors
+    (hwmon, thermal zones), a BMC through ipmitool, SMART through smartctl, and
+    NVIDIA GPUs through nvidia-smi. The slow ones are cached.
+  * Checks: websites, ports and game servers, probed from this server.
+
+What it may change: only the units, containers and checks the config names as
+controllable, through sudo rules that name each exact command. The config,
+/etc/sentinel-agent.conf, is the security boundary; `sentinel-agent --sudoers`
+writes the rules from the same argv this file runs, so the two cannot drift.
+"""
+
+import contextlib
+import fcntl
+import http.client
+import json
+import os
+import re
+import shlex
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "2.0.0"
+PROTOCOL = 2
+
+CONF_PATH = "/etc/sentinel-agent.conf"
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sentinel-agent")
+# Where the kernel's files are. Tests point these at recorded trees.
+SYS = "/sys"
+PROC = "/proc"
+
+DEFAULTS = {
+    # Control is opt-in: installed read-only unless install.sh --allow-control.
+    "allow_control": False,
+    # Watched: shown, with logs. Everything here can be read, nothing changed.
+    "units": [],
+    "containers": [],
+    # Controllable: a subset of the watched ones. A lifeline (see below) can
+    # only ever be restarted.
+    "control": {"units": [], "containers": []},
+    # Websites, ports and game servers, probed from this server (PROTOCOL.md).
+    "checks": [],
+    # Which hardware sources this server has; the installer fills these in.
+    #   sensors  the kernel's hwmon / thermal zones (no root needed)
+    #   ipmi     true when a BMC answers ipmitool
+    #   smart    [{"dev": "/dev/sda", "type": "sat"}, ...] from smartctl --scan-open
+    #   gpu      true when nvidia-smi works
+    "hardware": {"sensors": True, "ipmi": False, "smart": [], "gpu": False},
+    # Per-sensor overrides by label: {"Inlet": {"warn": 42, "crit": 47}}.
+    "thresholds": {},
+    # Absolute paths, resolved by the installer. sudo matches them literally.
+    "paths": {
+        "systemctl": "/usr/bin/systemctl",
+        "journalctl": "/usr/bin/journalctl",
+        "docker": "/usr/bin/docker",
+        "ipmitool": "/usr/bin/ipmitool",
+        "smartctl": "/usr/sbin/smartctl",
+        "nvidia-smi": "/usr/bin/nvidia-smi",
+        "systemd-detect-virt": "/usr/bin/systemd-detect-virt",
+    },
+    "hw_cache_s": 45,
+    "max_log_lines": 500,
+    "checks_interval_s": 60,
+}
+
+# Deliberately strict: these guard the *shape* of an argument. The real gate is
+# the configured whitelist, checked separately — a name can look perfect and
+# still not be something this key may touch.
+UNIT_RE = re.compile(r"^[A-Za-z0-9@:._-]{1,96}\.(service|socket|timer|target|mount)$")
+CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+KEY_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+# Anything from the config that ends up inside a sudo rule: no spaces, quotes,
+# globs or shell characters. A comma or colon is allowed (megaraid,0 and
+# instance units need them) and is escaped when the rule is written.
+SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9@%+./_,:-]{1,128}$")
+ACTIONS = ("start", "stop", "restart")
+CHECK_VERBS = ("start", "stop", "restart", "sleep")
+
+# Units a phone may restart but never stop: stopping any of these can cut off
+# every way back in, including the one the phone itself is using.
+LIFELINE_RE = re.compile(
+    r"^(ssh|sshd|tailscaled|NetworkManager|systemd-networkd|systemd-resolved|networking|"
+    r"wpa_supplicant|docker|containerd|cloudflared|zerotier-one|netbird|"
+    r"wg-quick@[^.]+|openvpn(@[^.]+)?|openvpn-client@[^.]+|openvpn-server@[^.]+)\.service$")
+
+# Fixed argv. Each sudo rule names one of these exactly, so a change here is a
+# change to the rules: `sentinel-agent --sudoers` regenerates them from these.
+DOCKER_PS = ["ps", "-a", "--no-trunc", "--format", "{{json .}}"]
+DOCKER_STATS = ["stats", "--no-stream", "--no-trunc", "--format", "{{json .}}"]
+# Logs are always fetched at the ceiling and trimmed here, so the rules can name
+# one exact count instead of a wildcard.
+LOG_TAIL = 500
+SEL_TAIL = 200
+UNIT_CHECK_VERBS = {"start": ["enable", "--now"], "stop": ["disable", "--now"], "restart": ["restart"]}
+SMART_ARGS = ["-j", "-n", "standby", "-H", "-A", "-i"]
+GPU_ARGS = ["--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,fan.speed",
+            "--format=csv,noheader,nounits"]
+
+CHECK_TIMEOUT = 3.0
+SMART_MAX_AGE = 1800
+GPU_MAX_AGE = 10
+
+
+# --------------------------------------------------------------------------- #
+# plumbing
+# --------------------------------------------------------------------------- #
+
+def out(obj, code=0):
+    json.dump(obj, sys.stdout, separators=(",", ":"), default=str)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+def fail(msg, **extra):
+    out({"ok": False, "error": str(msg), **extra})
+
+
+def _read_conf_file(path):
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        return (data if isinstance(data, dict) else {}), None
+    except FileNotFoundError:
+        return {}, None
+    except Exception as e:                                    # noqa: BLE001
+        return {}, f"{path}: {e}"
+
+
+def conf(path=None):
+    """The config, laid over the defaults, with the protocol-1 keys understood."""
+    raw, err = _read_conf_file(path or CONF_PATH)
+    c = json.loads(json.dumps(DEFAULTS))            # a deep copy
+    for k, v in raw.items():
+        if isinstance(c.get(k), dict) and isinstance(v, dict) and k in ("paths", "hardware", "control"):
+            c[k].update(v)
+        else:
+            c[k] = v
+    if err:
+        c["_conf_error"] = err
+
+    # Agent 1.x configs: one dashboard URL and a games map, and "allow_control"
+    # covering every watched unit and container.
+    checks = [ch for ch in (c.get("checks") or []) if isinstance(ch, dict)]
+    if raw.get("status_url") and not any(ch.get("kind") == "dashboard" for ch in checks):
+        checks.append({"key": "dashboard", "kind": "dashboard", "url": raw["status_url"],
+                       "hardware": True, "controls": raw.get("games") or {}})
+    c["checks"] = checks
+    if "control" not in raw:
+        c["control"] = {"units": list(c["units"]), "containers": list(c["containers"])}
+    for k in ("units", "containers"):
+        c[k] = [x for x in (c.get(k) or []) if isinstance(x, str)]
+    return c
+
+
+def path_of(cfg, tool):
+    p = (cfg.get("paths") or {}).get(tool) or DEFAULTS["paths"].get(tool) or tool
+    return str(p)
+
+
+def run(args, timeout=10):
+    """Run argv with no shell. Returns (rc, stdout, stderr); never raises."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{args[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{args[0]}: timed out after {timeout}s"
+    except Exception as e:                                    # noqa: BLE001
+        return 1, "", str(e)
+
+
+def sudo(cfg, tool, *args, timeout=10):
+    """Run one of the tools the sudo rules name, as root, by its absolute path."""
+    return run(["sudo", "-n", path_of(cfg, tool), *args], timeout=timeout)
+
+
+def _sudo_refused(stderr):
+    s = stderr or ""
+    return "password is required" in s or "not allowed" in s or "sudo: not found" in s
+
+
+def _last_line(*texts):
+    for text in texts:
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if lines:
+            return lines[-1][:300]
+    return ""
+
+
+def _read(path, default=None):
+    try:
+        with open(path, "r", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def _num(text, scale=1.0):
+    try:
+        return float(text) / scale
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# caches: one file per kind, each change under its own lock
+# --------------------------------------------------------------------------- #
+#
+# Agent 1.x read one state file at the start of a call and wrote it back at the
+# end, so a `snapshot` and a `checks` running at once (the phone multiplexes its
+# channels) overwrote each other's caches. Each cache now has its own file, and
+# a read-modify-write holds that file's lock only for the write.
+
+def _cache_path(name):
+    return os.path.join(STATE_DIR, name + ".json")
+
+
+def cache_get(name):
+    try:
+        with open(_cache_path(name), "r") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:                                         # noqa: BLE001
+        return {}
+
+
+@contextlib.contextmanager
+def _locked(name):
+    lock = None
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        lock = open(_cache_path(name) + ".lock", "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        lock = None          # a cache that cannot be locked is a slow agent, not a broken one
+    try:
+        yield
+    finally:
+        if lock:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+
+
+def cache_put(name, data):
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = f"{_cache_path(name)}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _cache_path(name))                    # atomic
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
+def cache_merge(name, updates):
+    """Lay `updates` over the cached dict, under the lock, and return the result."""
+    with _locked(name):
+        data = cache_get(name)
+        data.update(updates)
+        cache_put(name, data)
+        return data
+
+
+# --------------------------------------------------------------------------- #
+# /proc sampling
+# --------------------------------------------------------------------------- #
+
+def read_cpu_jiffies():
+    """Aggregate + per-core jiffy counters from /proc/stat."""
+    cpus = {}
+    with open(os.path.join(PROC, "stat")) as fh:
+        for line in fh:
+            if not line.startswith("cpu"):
+                break
+            parts = line.split()
+            cpus[parts[0]] = [int(x) for x in parts[1:]]
+    return cpus
+
+
+def read_net_counters():
+    counters = {}
+    with open(os.path.join(PROC, "net/dev")) as fh:
+        for line in fh.readlines()[2:]:
+            name, _, rest = line.partition(":")
+            f = rest.split()
+            if len(f) >= 16:
+                counters[name.strip()] = [int(f[0]), int(f[8])]     # rx, tx bytes
+    return counters
+
+
+def read_proc_cpu():
+    """utime+stime per pid, for a real per-process CPU rate (not ps's average)."""
+    procs = {}
+    try:
+        pids = [d for d in os.listdir(PROC) if d.isdigit()]
+    except OSError:
+        return procs
+    for pid in pids:
+        try:
+            with open(os.path.join(PROC, pid, "stat")) as fh:
+                data = fh.read()
+            close = data.rfind(")")                # comm can contain spaces/parens
+            comm = data[data.find("(") + 1:close]
+            f = data[close + 2:].split()
+            procs[pid] = (int(f[11]) + int(f[12]), comm)   # utime, stime
+        except (OSError, ValueError, IndexError):
+            continue
+    return procs
+
+
+def cpu_pct(prev, cur):
+    """Busy share between two jiffy snapshots, per key."""
+    result = {}
+    for key, now in cur.items():
+        before = prev.get(key)
+        if not before or len(before) < 4:
+            continue
+        total = sum(now) - sum(before)
+        idle = (now[3] + now[4]) - (before[3] + before[4])   # idle + iowait
+        if total > 0:
+            result[key] = max(0.0, min(100.0, 100.0 * (total - idle) / total))
+    return result
+
+
+def sample(iface_names):
+    """
+    CPU/net/process rates. Uses the cached previous sample when it is fresh
+    enough to be meaningful, and otherwise pays for a real 300 ms second sample.
+    Never falls back to a since-boot average.
+    """
+    now = time.time()
+    prev = cache_get("sample") or None
+    cur_cpu, cur_net, cur_procs = read_cpu_jiffies(), read_net_counters(), read_proc_cpu()
+
+    age = now - prev["t"] if prev and "t" in prev else None
+    if not prev or age is None or age < 0.4 or age > 120:
+        time.sleep(0.3)
+        base_cpu, base_net, base_procs = cur_cpu, cur_net, cur_procs
+        base_t = now
+        cur_cpu, cur_net, cur_procs = read_cpu_jiffies(), read_net_counters(), read_proc_cpu()
+        now = time.time()
+    else:
+        base_cpu = prev.get("cpu", {})
+        base_net = prev.get("net", {})
+        base_procs = {k: (v, "") for k, v in prev.get("procs", {}).items()}
+        base_t = prev["t"]
+
+    window = max(0.05, now - base_t)
+    pcts = cpu_pct(base_cpu, cur_cpu)
+    cores = sorted(((k, v) for k, v in pcts.items() if k != "cpu"), key=lambda kv: int(kv[0][3:] or 0))
+
+    hz = os.sysconf("SC_CLK_TCK")
+    top = []
+    for pid, (jiffies, comm) in cur_procs.items():
+        before = base_procs.get(pid)
+        if not before:
+            continue
+        delta = jiffies - before[0]
+        if delta <= 0:
+            continue
+        top.append({"pid": int(pid), "name": comm, "cpu_pct": round(100.0 * delta / hz / window, 1)})
+    top.sort(key=lambda p: -p["cpu_pct"])
+    top = [p for p in top[:8] if p["cpu_pct"] >= 0.5]
+    for p in top:
+        try:
+            with open(os.path.join(PROC, str(p["pid"]), "statm")) as fh:
+                p["rss_mb"] = round(int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
+        except (OSError, ValueError, IndexError):
+            p["rss_mb"] = None
+
+    nets = []
+    for name in iface_names:
+        a, b = base_net.get(name), cur_net.get(name)
+        if not a or not b:
+            continue
+        nets.append({
+            "iface": name,
+            "rx_bps": round(max(0, b[0] - a[0]) / window, 1),
+            "tx_bps": round(max(0, b[1] - a[1]) / window, 1),
+            "rx_total": b[0],
+            "tx_total": b[1],
+        })
+
+    cache_put("sample", {"t": now, "cpu": cur_cpu, "net": cur_net,
+                         "procs": {k: v[0] for k, v in cur_procs.items()}})
+    return {
+        "cpu_pct": round(pcts.get("cpu", 0.0), 1),
+        "cores": [round(v, 1) for _, v in cores],
+        "window_s": round(window, 2),
+        "top": top,
+        "net": nets,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# host
+# --------------------------------------------------------------------------- #
+
+def meminfo():
+    m = {}
+    with open(os.path.join(PROC, "meminfo")) as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            try:
+                m[k] = int(v.split()[0])          # kB
+            except (ValueError, IndexError):
+                continue
+    total = m.get("MemTotal", 0)
+    avail = m.get("MemAvailable", 0)
+    sw_total = m.get("SwapTotal", 0)
+    return {
+        "total_mb": total // 1024,
+        "used_mb": (total - avail) // 1024,
+        "available_mb": avail // 1024,
+        "cached_mb": (m.get("Cached", 0) + m.get("Buffers", 0)) // 1024,
+        "swap_total_mb": sw_total // 1024,
+        "swap_used_mb": (sw_total - m.get("SwapFree", 0)) // 1024,
+    }
+
+
+def pressure(kind):
+    """PSI — the honest 'is this box overloaded?' signal, unlike load average."""
+    try:
+        with open(os.path.join(PROC, "pressure", kind)) as fh:
+            for line in fh:
+                if line.startswith("some"):
+                    return float(line.split("avg10=")[1].split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def disks():
+    out_ = []
+    seen = set()
+    try:
+        with open(os.path.join(PROC, "mounts")) as fh:
+            mounts = fh.readlines()
+    except OSError:
+        return out_
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        dev, mnt = parts[0], parts[1].replace("\\040", " ")
+        if not dev.startswith("/dev/") or mnt in seen or dev.startswith("/dev/loop"):
+            continue
+        seen.add(mnt)
+        try:
+            st = os.statvfs(mnt)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if total < 1_000_000_000:                 # skip /boot-sized partitions
+            continue
+        free = st.f_bavail * st.f_frsize
+        out_.append({
+            "mount": mnt,
+            "device": dev,
+            "total_gb": round(total / 1e9, 1),
+            "used_gb": round((total - st.f_bfree * st.f_frsize) / 1e9, 1),
+            "free_gb": round(free / 1e9, 1),
+            "used_pct": round(100.0 * (total - free) / total, 1) if total else 0.0,
+        })
+    return out_
+
+
+def default_iface():
+    """The interface of the default route (lowest metric), or None."""
+    best = None
+    try:
+        with open(os.path.join(PROC, "net/route")) as fh:
+            for line in fh.readlines()[1:]:
+                f = line.split()
+                if len(f) >= 7 and f[1] == "00000000":
+                    metric = int(f[6]) if f[6].isdigit() else 0
+                    if best is None or metric < best[1]:
+                        best = (f[0], metric)
+    except OSError:
+        pass
+    return best[0] if best else None
+
+
+def iface_names():
+    try:
+        names = sorted(os.listdir(os.path.join(SYS, "class/net")))
+    except OSError:
+        names = []
+    # Loopback and the per-container veth churn are noise on a phone screen.
+    return [n for n in names if n != "lo" and not n.startswith(("veth", "br-", "docker"))]
+
+
+def host_block(rates=True):
+    with open(os.path.join(PROC, "uptime")) as fh:
+        uptime_s = int(float(fh.read().split()[0]))
+    load1, load5, load15 = os.getloadavg()
+    names = iface_names()
+    block = {
+        "hostname": socket.gethostname(),
+        "uptime_s": uptime_s,
+        "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
+        "ncpu": os.cpu_count() or 1,
+        "psi_cpu": pressure("cpu"),
+        "psi_io": pressure("io"),
+        "psi_mem": pressure("memory"),
+        "mem": meminfo(),
+        "disks": disks(),
+        "primary_iface": default_iface() or (names[0] if names else ""),
+    }
+    if rates:
+        s = sample(names)
+        block.update({"cpu_pct": s["cpu_pct"], "cores": s["cores"], "window_s": s["window_s"],
+                      "net": s["net"], "top": s["top"]})
+    return block
+
+
+# --------------------------------------------------------------------------- #
+# systemd + docker
+# --------------------------------------------------------------------------- #
+
+SHOW_PROPS = ("Id", "Description", "ActiveState", "SubState", "UnitFileState",
+              "ExecMainStartTimestamp", "NRestarts", "MemoryCurrent", "MainPID",
+              "Result", "LoadState")
+
+
+def _show_blocks(text):
+    blocks, cur = [], {}
+    for line in text.splitlines():
+        if not line.strip():
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        k, _, v = line.partition("=")
+        cur[k] = v
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def services(cfg, units):
+    """One `systemctl show` for every unit — N forks here would be N × latency."""
+    if not units:
+        return []
+    rc, so, se = run([path_of(cfg, "systemctl"), "show", "--no-pager",
+                      *[f"--property={p}" for p in SHOW_PROPS], *units], timeout=15)
+    if rc != 0 and not so:
+        return [{"unit": u, "error": se.strip() or f"systemctl exited {rc}"} for u in units]
+    result = []
+    for b in _show_blocks(so):
+        mem = b.get("MemoryCurrent", "")
+        started = b.get("ExecMainStartTimestamp", "").strip()
+        result.append({
+            "unit": b.get("Id", "?"),
+            "description": b.get("Description", ""),
+            "active": b.get("ActiveState", "unknown"),
+            "sub": b.get("SubState", "unknown"),
+            "enabled": b.get("UnitFileState", ""),
+            "loaded": b.get("LoadState", ""),
+            "restarts": int(b["NRestarts"]) if b.get("NRestarts", "").isdigit() else 0,
+            # systemd reports [not set] / infinity for units with no cgroup accounting.
+            "mem_mb": round(int(mem) / 1048576, 1) if mem.isdigit() else None,
+            "pid": int(b["MainPID"]) if b.get("MainPID", "").isdigit() and b["MainPID"] != "0" else None,
+            "since": started or None,
+            "result": b.get("Result", ""),
+        })
+    return result
+
+
+def docker_ps(cfg):
+    """Every container (name -> ps row), or (None, error)."""
+    rc, so, se = sudo(cfg, "docker", *DOCKER_PS, timeout=15)
+    if rc != 0:
+        return None, (se.strip() or f"docker exited {rc}")[:200]
+    rows = {}
+    for line in so.splitlines():
+        try:
+            c = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rows[c.get("Names", "")] = c
+    return rows, None
+
+
+def containers(cfg, names, stats=True):
+    """The watched containers, plus how many others exist."""
+    if not names:
+        return {"error": None, "list": []}, 0
+    rows, err = docker_ps(cfg)
+    if rows is None:
+        return {"error": err, "list": []}, 0
+    found = []
+    for name in names:
+        c = rows.get(name)
+        if c is None:
+            found.append({"name": name, "image": "", "state": "missing",
+                          "status": "no container of this name", "health": None, "running_for": ""})
+            continue
+        status = c.get("Status", "")
+        health = None
+        if "(healthy)" in status:
+            health = "healthy"
+        elif "(unhealthy)" in status:
+            health = "unhealthy"
+        elif "(health: starting)" in status:
+            health = "starting"
+        found.append({
+            "name": name,
+            "image": c.get("Image", ""),
+            "state": c.get("State", ""),
+            "status": status,
+            "health": health,
+            "running_for": c.get("RunningFor", ""),
+        })
+    unwatched = len([n for n in rows if n not in set(names)])
+
+    # `docker stats` blocks for a sampling window, so only pay for it when
+    # something is actually running.
+    if stats and any(c["state"] == "running" for c in found):
+        rc, so, _ = sudo(cfg, "docker", *DOCKER_STATS, timeout=20)
+        if rc == 0:
+            st_by_name = {}
+            for line in so.splitlines():
+                try:
+                    st = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                st_by_name[st.get("Name", "")] = st
+            for c in found:
+                st = st_by_name.get(c["name"])
+                if st:
+                    c["cpu_pct"] = _pct(st.get("CPUPerc", ""))
+                    c["mem"] = st.get("MemUsage", "")
+                    c["mem_pct"] = _pct(st.get("MemPerc", ""))
+    return {"error": None, "list": found}, unwatched
+
+
+def _pct(text):
+    try:
+        return round(float(str(text).strip().rstrip("%")), 1)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# hardware: the model
+# --------------------------------------------------------------------------- #
+
+_JUNK_DMI = re.compile(r"^(to be filled|system product name|system manufacturer|default string|"
+                       r"not applicable|not specified|o\.e\.m\.|none|$)", re.I)
+
+
+def model(cfg):
+    cached = cache_get("model")
+    if cached.get("v") == 1:
+        return cached["model"]
+    dmi = os.path.join(SYS, "class/dmi/id")
+    vendor = _read(os.path.join(dmi, "sys_vendor")) or ""
+    name = _read(os.path.join(dmi, "product_name")) or ""
+    if _JUNK_DMI.match(name):
+        name = _read(os.path.join(dmi, "board_name")) or ""
+        vendor = _read(os.path.join(dmi, "board_vendor")) or vendor
+    if _JUNK_DMI.match(name):
+        name = ""
+    if _JUNK_DMI.match(vendor):
+        vendor = ""
+    tree = _read(os.path.join(PROC, "device-tree/model"))
+    if tree and not name:                          # a Raspberry Pi, or another board
+        name = tree.replace("\x00", "").strip()
+    rc, so, _ = run([path_of(cfg, "systemd-detect-virt")], timeout=5)
+    virt = so.strip() if rc == 0 and so.strip() and so.strip() != "none" else None
+    result = {"vendor": vendor or None, "name": name or None, "virt": virt}
+    cache_put("model", {"v": 1, "model": result})
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# hardware: kernel sensors
+# --------------------------------------------------------------------------- #
+
+def _hwmon_group(chip):
+    n = chip.lower()
+    if n in ("coretemp", "k10temp", "k8temp", "zenpower", "cpu_thermal", "soc_thermal", "cpu-thermal",
+             "x86_pkg_temp", "fam15h_power") or n.startswith(("cpu", "soc")):
+        return "cpu"
+    if n in ("nvme", "drivetemp") or n.startswith("nvme"):
+        return "drive"
+    if n in ("amdgpu", "radeon", "nouveau", "i915", "xe"):
+        return "gpu"
+    if n.startswith(("acpitz", "pch_", "nct", "it8", "w83", "f71", "asus", "dell_smm", "thinkpad",
+                     "spd5118", "jc42", "gigabyte", "aquacomputer")):
+        return "board"
+    return "other"
+
+
+def _attr_dir(chip_dir):
+    """Modern kernels keep the attributes next to `name`; older ones under device/."""
+    if os.path.exists(os.path.join(chip_dir, "name")):
+        return chip_dir
+    if os.path.exists(os.path.join(chip_dir, "device", "name")):
+        return os.path.join(chip_dir, "device")
+    return chip_dir
+
+
+def _sane_c(v):
+    return v is not None and -40.0 < v < 150.0
+
+
+def _chip_label(chip_dir, chip, group):
+    """What sets one chip apart from another of the same kind: an NVMe or disk's name."""
+    if group != "drive":
+        return None
+    link = os.path.realpath(os.path.join(chip_dir, "device"))
+    base = os.path.basename(link)
+    if base.startswith("nvme"):
+        return base
+    model_ = _read(os.path.join(chip_dir, "device", "model"))
+    return model_ or None
+
+
+def _natural(s):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+
+
+def read_hwmon():
+    """Temperatures and fans from /sys/class/hwmon, with the kernel's own thresholds."""
+    base = os.path.join(SYS, "class/hwmon")
+    try:
+        chips = sorted(os.listdir(base), key=_natural)
+    except OSError:
+        return [], [], None
+    names = {}
+    for chip in chips:
+        names.setdefault(_read(os.path.join(_attr_dir(os.path.join(base, chip)), "name")) or chip, []).append(chip)
+
+    temps, fans = [], []
+    for chip in chips:
+        chip_dir = os.path.join(base, chip)
+        attrs = _attr_dir(chip_dir)
+        name = _read(os.path.join(attrs, "name")) or chip
+        group = _hwmon_group(name)
+        siblings = names.get(name, [chip])
+        prefix = None
+        own = _chip_label(chip_dir, name, group)
+        if own:
+            prefix = own
+        elif len(siblings) > 1:
+            prefix = f"CPU {siblings.index(chip) + 1}" if group == "cpu" else f"{name} {siblings.index(chip) + 1}"
+        try:
+            files = os.listdir(attrs)
+        except OSError:
+            continue
+        for f in sorted(files, key=_natural):
+            m = re.fullmatch(r"temp(\d+)_input", f)
+            if m:
+                n = m.group(1)
+                c = _num(_read(os.path.join(attrs, f)), 1000.0)
+                if not _sane_c(c):
+                    continue
+                label = _read(os.path.join(attrs, f"temp{n}_label")) or f"{name} {n}"
+                warn = _num(_read(os.path.join(attrs, f"temp{n}_max")), 1000.0)
+                crit = _num(_read(os.path.join(attrs, f"temp{n}_crit")), 1000.0)
+                temps.append({
+                    "label": f"{prefix} · {label}" if prefix else label,
+                    "group": group,
+                    "celsius": round(c, 1),
+                    "warn": round(warn, 1) if _sane_c(warn) and warn > 0 else None,
+                    "crit": round(crit, 1) if _sane_c(crit) and crit > 0 else None,
+                    "status": None,
+                    "source": "sensors",
+                })
+                continue
+            m = re.fullmatch(r"fan(\d+)_input", f)
+            if m:
+                n = m.group(1)
+                rpm = _num(_read(os.path.join(attrs, f)))
+                # Super-I/O chips report 0 for every header with nothing on it,
+                # which would read as a dead fan. A BMC tells the two apart; the
+                # kernel's sensors cannot, so a 0 here is left out.
+                if rpm is None or rpm <= 0:
+                    continue
+                label = _read(os.path.join(attrs, f"fan{n}_label")) or f"Fan {n}"
+                fans.append({"label": f"{prefix} · {label}" if prefix else label,
+                             "rpm": round(rpm), "status": None, "source": "sensors"})
+    return temps, fans, None
+
+
+def read_thermal_zones():
+    """The fallback for boards whose sensors are thermal zones only (a Raspberry Pi)."""
+    base = os.path.join(SYS, "class/thermal")
+    temps = []
+    try:
+        zones = sorted((z for z in os.listdir(base) if z.startswith("thermal_zone")), key=_natural)
+    except OSError:
+        return temps
+    for z in zones:
+        d = os.path.join(base, z)
+        kind = _read(os.path.join(d, "type")) or z
+        c = _num(_read(os.path.join(d, "temp")), 1000.0)
+        if not _sane_c(c):
+            continue
+        warn = crit = None
+        for i in range(12):
+            t = _num(_read(os.path.join(d, f"trip_point_{i}_temp")), 1000.0)
+            typ = _read(os.path.join(d, f"trip_point_{i}_type"))
+            if t is None or typ is None:
+                break
+            if not _sane_c(t) or t <= 0:
+                continue
+            if typ in ("passive", "hot") and (warn is None or t < warn):
+                warn = t
+            elif typ == "critical":
+                crit = t
+        temps.append({"label": kind, "group": _hwmon_group(kind), "celsius": round(c, 1),
+                      "warn": warn, "crit": crit, "status": None, "source": "sensors"})
+    return temps
+
+
+def kernel_sensors():
+    temps, fans, err = read_hwmon()
+    if not temps:
+        temps = read_thermal_zones()
+    return temps, fans, err
+
+
+# --------------------------------------------------------------------------- #
+# hardware: a BMC, any vendor
+# --------------------------------------------------------------------------- #
+
+def _reading(text):
+    """
+    Split '4680 RPM' into (4680.0, 'RPM').
+
+    'Not Readable' and 'No Reading' come back as None, never 0 — a fan at 0 RPM
+    is an emergency, a fan the BMC declines to report is a quirk.
+    """
+    text = text.strip()
+    if not text or text.lower().startswith(("not readable", "no reading", "disabled")):
+        return None, ""
+    m = re.match(r"^(-?\d+(?:\.\d+)?)\s*(.*)$", text)
+    if not m:
+        return None, text
+    return float(m.group(1)), m.group(2).strip()
+
+
+# The status column of `ipmitool sdr elist`: what the BMC itself makes of the
+# reading against its own thresholds. nc = non-critical, cr = critical,
+# nr = non-recoverable. This is how every vendor's thresholds reach the app
+# without anybody typing them in.
+_SDR_STATUS = {"ok": "ok", "nc": "warn", "cr": "crit", "nr": "crit"}
+
+_FAN_RE = re.compile(r"(?i)^(?:sys(?:tem)?[\s_]*)?fan[\s_]*(\d+)[\s_]*([ab])?(?:[\s_]*rpm)?$")
+_WATTS_RE = re.compile(r"(?i)(pwr|power)[\s_]*(consumption|meter)|system[\s_]*(level|power)|total[\s_]*power|^power$")
+
+
+def parse_sdr(text):
+    """
+    `ipmitool sdr elist` -> (the protocol-1 detail, hardware temps, hardware fans).
+
+    Classified by the unit of each reading and the entity ID it belongs to, not
+    by one vendor's sensor names: degrees C is a temperature, RPM a fan, Watts
+    power; entity 3 / 65 is a processor and entity 10 a power supply. Dell's
+    names (Inlet Temp, Fan1A, Pwr Consumption) are what the R620 these rules
+    were first written against calls them, and they still come out the same.
+    """
+    temps1, temps2, fans2 = [], [], []
+    fans1, psus = {}, {}
+    watts = None
+    fan_redundancy = ps_redundancy = None
+    auto_fan = 100
+
+    for line in text.splitlines():
+        f = [c.strip() for c in line.split("|")]
+        if len(f) < 5:
+            continue
+        name, _sid, state, entity, raw = f[0], f[1], f[2], f[3], f[4]
+        value, unit = _reading(raw)
+        status = _SDR_STATUS.get(state)
+        ent = entity.split(".")[0] if "." in entity else entity
+        inst = entity.split(".")[1] if "." in entity else "1"
+        lname = name.lower()
+
+        if unit.lower().startswith("degrees c"):
+            if "inlet" in lname or "ambient" in lname or "intake" in lname:
+                label, kind = "Inlet", "inlet"
+            elif "exhaust" in lname or "outlet" in lname:
+                label, kind = "Exhaust", "exhaust"
+            elif ent in ("3", "65"):
+                label = f"CPU {inst}" if lname in ("temp", "cpu temp") else f"CPU {inst} {name}"
+                kind = "cpu"
+            else:
+                label, kind = re.sub(r"(?i)\s*temp$", "", name) or name, "board"
+            temps1.append({"label": label, "kind": kind, "celsius": value, "state": state})
+            temps2.append({"label": label, "group": kind, "celsius": value, "warn": None, "crit": None,
+                           "status": status, "source": "ipmi"})
+
+        elif unit.upper() == "RPM":
+            m = _FAN_RE.fullmatch(name)
+            if m:
+                idx, side = int(m.group(1)), (m.group(2) or "a").lower()
+            else:
+                auto_fan += 1
+                idx, side = auto_fan, "a"
+            fans1.setdefault(idx, {"module": idx, "a_rpm": None, "b_rpm": None, "state": state})
+            fans1[idx]["a_rpm" if side == "a" else "b_rpm"] = value
+            label = f"Fan {idx}{side.upper()}" if m and m.group(2) else (f"Fan {idx}" if m else name)
+            fans2.append({"label": label, "rpm": value, "status": status, "source": "ipmi"})
+
+        elif "redundancy" in lname and "fan" in lname:
+            fan_redundancy = raw
+        elif "redundancy" in lname and ("ps" in lname or "power" in lname):
+            ps_redundancy = raw
+
+        elif ent == "10":
+            bay = int(inst) if inst.isdigit() else len(psus) + 1
+            p = psus.setdefault(bay, {"bay": bay})
+            if unit == "Amps":
+                p["amps"] = value
+            elif unit == "Volts":
+                p["volts"] = value
+            elif unit == "Watts":
+                p["input_watts"] = value
+            elif value is None and raw:
+                low = raw.lower()
+                if lname.startswith("status") or "presence" not in lname:
+                    p["status"] = raw
+                    p["fault"] = any(w in low for w in ("fail", "fault", "lost", "predictive"))
+
+        elif unit == "Watts" and watts is None and _WATTS_RE.search(name):
+            watts = value
+
+    bays = sorted(psus.values(), key=lambda p: p["bay"])
+    if watts is None:
+        direct = [p.get("input_watts") for p in bays if p.get("input_watts") is not None]
+        watts = sum(direct) if direct else None
+    # A BMC that cannot meter each supply (Dell quantises bay current to 0.2 A)
+    # gets the accurate chassis total split in proportion to the bay currents,
+    # rather than an invented 50/50.
+    amps_total = sum(p.get("amps") or 0.0 for p in bays if not p.get("fault"))
+    for p in bays:
+        p.setdefault("fault", False)
+        if p.get("input_watts") is not None:
+            p["watts"] = p.pop("input_watts")
+        elif watts is None or amps_total <= 0 or p.get("fault"):
+            p["watts"] = None
+        else:
+            p["watts"] = round(watts * (p.get("amps") or 0.0) / amps_total)
+
+    detail = {
+        "temps": temps1,
+        "fans": sorted(fans1.values(), key=lambda x: x["module"]),
+        "psus": bays,
+        "watts": watts,
+        "fan_redundancy": fan_redundancy,
+        "ps_redundancy": ps_redundancy,
+    }
+    return detail, temps2, fans2
+
+
+def read_bmc(cfg):
+    """(detail, temps2, fans2, error), cached for hw_cache_s: one sdr read is ~1.8 s."""
+    cached = cache_get("bmc")
+    if cached and time.time() - cached.get("t", 0) < cfg["hw_cache_s"]:
+        return cached["detail"], cached["temps"], cached["fans"], None
+    rc, so, se = sudo(cfg, "ipmitool", "sdr", "elist", timeout=25)
+    if rc != 0:
+        return None, [], [], (se.strip() or f"ipmitool exited {rc}")[:200]
+    detail, temps2, fans2 = parse_sdr(so)
+    cache_put("bmc", {"t": time.time(), "detail": detail, "temps": temps2, "fans": fans2})
+    return detail, temps2, fans2, None
+
+
+def cached_bmc(cfg):
+    cached = cache_get("bmc")
+    if cached and time.time() - cached.get("t", 0) < 10 * 60:
+        return cached["detail"], cached["temps"], cached["fans"]
+    return None, [], []
+
+
+def summarize_bmc(full):
+    """Collapse the detailed BMC read into the protocol-1 summary `snapshot` returns."""
+    temps = full.get("temps", [])
+
+    def one(kind):
+        return next((t["celsius"] for t in temps if t["kind"] == kind), None)
+
+    cpu = [t["celsius"] for t in temps if t["kind"] == "cpu" and t["celsius"] is not None]
+    rpms = [r for f in full.get("fans", []) for r in (f["a_rpm"], f["b_rpm"]) if r is not None]
+    return {
+        "inlet_c": one("inlet"),
+        "exhaust_c": one("exhaust"),
+        "cpu_max_c": max(cpu) if cpu else None,
+        "fan_modules": len(full.get("fans", [])),
+        "fan_avg_rpm": round(sum(rpms) / len(rpms)) if rpms else None,
+        "watts": full.get("watts"),
+        "redundancy": full.get("fan_redundancy"),
+        "psus": [
+            {"bay": p.get("bay"), "volts": p.get("volts"), "amps": p.get("amps"),
+             "watts": p.get("watts"), "fault": bool(p.get("fault"))}
+            for p in full.get("psus", [])
+        ],
+    }
+
+
+def summarize_status_hw(hw):
+    """The same summary, from a status dashboard's own field names."""
+    return {
+        "inlet_c": hw.get("inlet_c"),
+        "exhaust_c": hw.get("exhaust_c"),
+        "cpu_max_c": hw.get("cpu_max_c"),
+        "fan_modules": hw.get("fan_modules"),
+        "fan_avg_rpm": hw.get("fan_avg_rpm"),
+        "watts": hw.get("watts"),
+        "redundancy": hw.get("redundancy"),
+        "psus": [
+            {"bay": p.get("index"), "volts": p.get("volts"), "amps": p.get("amps"),
+             "watts": p.get("watts"), "fault": bool(p.get("fault"))}
+            for p in hw.get("psus", [])
+        ],
+    }
+
+
+def dashboard_bmc(hw):
+    """A dashboard's hardware summary as a BMC read: (detail, temps, fans, error).
+    The dashboard already polls the BMC on its own timer; reading it a second
+    time from here would double the slowest call on the machine."""
+    temps = []
+    for key, label, group in (("inlet_c", "Inlet", "inlet"), ("exhaust_c", "Exhaust", "exhaust"),
+                              ("cpu_max_c", "CPU (hottest)", "cpu")):
+        v = hw.get(key)
+        if isinstance(v, (int, float)):
+            temps.append({"label": label, "group": group, "celsius": float(v), "warn": None, "crit": None,
+                          "status": None, "source": "ipmi"})
+    fans = []
+    if isinstance(hw.get("fan_avg_rpm"), (int, float)):
+        fans.append({"label": "Fans (average)", "rpm": float(hw["fan_avg_rpm"]), "status": None, "source": "ipmi"})
+    return {"watts": hw.get("watts")}, temps, fans, None
+
+
+def read_sel(cfg, limit):
+    rc, so, se = sudo(cfg, "ipmitool", "sel", "elist", "last", str(SEL_TAIL), timeout=30)
+    if rc != 0:
+        return None, (se.strip() or f"ipmitool exited {rc}")[:200]
+    events = []
+    for line in so.splitlines():
+        f = [c.strip() for c in line.split("|")]
+        if len(f) < 5:
+            continue
+        events.append({
+            "id": f[0], "date": f[1], "time": f[2], "sensor": f[3], "event": f[4],
+            "direction": f[5] if len(f) > 5 else "",
+            "detail": f[6] if len(f) > 6 else "",
+        })
+    events.reverse()                      # newest first, which is what a phone wants
+    return events[:limit], None
+
+
+# --------------------------------------------------------------------------- #
+# hardware: SMART
+# --------------------------------------------------------------------------- #
+
+def smart_devices(cfg):
+    out_ = []
+    for d in (cfg.get("hardware") or {}).get("smart") or []:
+        if not isinstance(d, dict):
+            continue
+        dev, typ = str(d.get("dev") or ""), d.get("type")
+        if not dev.startswith("/dev/") or not SAFE_ARG_RE.fullmatch(dev):
+            continue
+        if typ is not None and not SAFE_ARG_RE.fullmatch(str(typ)):
+            continue
+        out_.append((dev, str(typ) if typ else None))
+    return out_
+
+
+def smart_argv(cfg, dev, typ):
+    return [path_of(cfg, "smartctl"), *SMART_ARGS, *(["-d", typ] if typ else []), dev]
+
+
+def _smart_id(dev, typ):
+    return f"{dev} [{typ}]" if typ and typ not in ("sat", "nvme", "scsi", "ata", "auto") else dev
+
+
+def parse_smart(text):
+    """smartctl -j output -> one drive. Always the JSON, never the exit code:
+    the code is a bitmask (2 means "in standby, skipped"; 64 an error logged
+    years ago), and a non-zero code very often carries a perfectly good read."""
+    try:
+        j = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {"state": "error", "error": "smartctl did not answer in JSON (smartmontools 7+ is needed)"}
+    msgs = " ".join(m.get("string", "") for m in (j.get("smartctl") or {}).get("messages", []) if isinstance(m, dict))
+    if re.search(r"STANDBY|SLEEP|IDLE_B", msgs, re.I) and "smart_status" not in j:
+        return {"state": "standby"}
+    passed = (j.get("smart_status") or {}).get("passed")
+    attrs = {a.get("id"): a for a in (j.get("ata_smart_attributes") or {}).get("table", []) if isinstance(a, dict)}
+
+    def raw(i):
+        a = attrs.get(i)
+        return int((a.get("raw") or {}).get("value")) if a and isinstance((a.get("raw") or {}).get("value"), int) else None
+
+    nvme = j.get("nvme_smart_health_information_log") or {}
+    realloc = raw(5)
+    if realloc is None and isinstance(j.get("scsi_grown_defect_list"), int):
+        realloc = j["scsi_grown_defect_list"]
+    drive = {
+        "model": j.get("model_name") or j.get("scsi_model_name") or j.get("model_family") or None,
+        "health": None if passed is None else ("passed" if passed else "failed"),
+        "celsius": (j.get("temperature") or {}).get("current"),
+        "hours": (j.get("power_on_time") or {}).get("hours"),
+        "wear_pct": nvme.get("percentage_used"),
+        "realloc": realloc,
+        "pending": raw(197),
+        "state": "active",
+    }
+    if drive["model"] is None and passed is None and not attrs and not nvme:
+        drive["state"] = "error"
+        drive["error"] = msgs[:200] or "smartctl could not read this drive"
+    return drive
+
+
+def read_smart(cfg, which="stalest"):
+    """
+    Refresh SMART readings: `which` is "stalest" (at most one drive, the one
+    read longest ago, if it is older than 30 minutes — so a poll never pays for
+    more than one), "all" (every drive older than 30 minutes) or "none".
+    Returns (drives, error).
+    """
+    devs = smart_devices(cfg)
+    if not devs:
+        return [], None
+    cached = cache_get("smart")
+    now = time.time()
+    stale = [(d, t) for d, t in devs if now - (cached.get(_smart_id(d, t)) or {}).get("t", 0) > SMART_MAX_AGE]
+    if which == "stalest":
+        stale.sort(key=lambda dt: (cached.get(_smart_id(*dt)) or {}).get("t", 0))
+        stale = stale[:1]
+    elif which == "none":
+        stale = []
+    updates = {}
+    err = None
+    for dev, typ in stale:
+        rc, so, se = run(["sudo", "-n", *smart_argv(cfg, dev, typ)], timeout=25)
+        if not so.strip() and _sudo_refused(se):
+            err = "sudo refused smartctl: re-run the Sentinel installer"
+            break
+        reading = parse_smart(so)
+        prev = cached.get(_smart_id(dev, typ)) or {}
+        if reading.get("state") == "standby" and prev.get("drive"):
+            kept = dict(prev["drive"])
+            kept["state"] = "standby"
+            updates[_smart_id(dev, typ)] = {"t": now, "drive": kept, "read_t": prev.get("read_t", now)}
+        else:
+            updates[_smart_id(dev, typ)] = {"t": now, "drive": reading, "read_t": now}
+    if updates:
+        cached = cache_merge("smart", updates)
+    drives = []
+    for dev, typ in devs:
+        entry = cached.get(_smart_id(dev, typ))
+        if not entry:
+            continue
+        d = {"device": _smart_id(dev, typ)}
+        d.update(entry.get("drive") or {})
+        d["age_s"] = int(now - entry.get("read_t", entry.get("t", now)))
+        drives.append(d)
+    return drives, err
+
+
+# --------------------------------------------------------------------------- #
+# hardware: NVIDIA GPUs
+# --------------------------------------------------------------------------- #
+
+def parse_nvidia_smi(text):
+    gpus = []
+    for line in text.replace("\r", "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 8:
+            continue
+
+        def n(x):
+            return None if x.startswith("[") or x.upper() in ("N/A", "") else _num(x)
+        gpus.append({
+            "index": int(f[0]) if f[0].isdigit() else len(gpus),
+            "name": f[1],
+            "celsius": n(f[2]),
+            "util_pct": n(f[3]),
+            "mem_used_mb": n(f[4]),
+            "mem_total_mb": n(f[5]),
+            "watts": n(f[6]),
+            "fan_pct": n(f[7]),
+        })
+    return gpus
+
+
+def read_gpu(cfg, fresh=True):
+    cached = cache_get("gpu")
+    if cached and (not fresh or time.time() - cached.get("t", 0) < GPU_MAX_AGE):
+        return cached.get("gpus", []), cached.get("error")
+    rc, so, se = run([path_of(cfg, "nvidia-smi"), *GPU_ARGS], timeout=10)
+    if rc != 0:
+        gpus, err = [], (_last_line(se, so) or f"nvidia-smi exited {rc}")[:200]
+    else:
+        gpus, err = parse_nvidia_smi(so), None
+    cache_put("gpu", {"t": time.time(), "gpus": gpus, "error": err})
+    return gpus, err
+
+
+# --------------------------------------------------------------------------- #
+# hardware: everything together
+# --------------------------------------------------------------------------- #
+
+def _apply_thresholds(cfg, temps):
+    over = {str(k).lower(): v for k, v in (cfg.get("thresholds") or {}).items() if isinstance(v, dict)}
+    for t in temps:
+        o = over.get(t["label"].lower())
+        if o:
+            if isinstance(o.get("warn"), (int, float)):
+                t["warn"] = float(o["warn"])
+            if isinstance(o.get("crit"), (int, float)):
+                t["crit"] = float(o["crit"])
+    return temps
+
+
+def features(cfg):
+    hw = cfg.get("hardware") or {}
+    f = []
+    if cfg.get("checks"):
+        f.append("checks")
+    if hw.get("sensors", True):
+        f.append("sensors")
+    if hw.get("ipmi"):
+        f.append("ipmi")
+    if smart_devices(cfg):
+        f.append("smart")
+    if hw.get("gpu"):
+        f.append("gpu")
+    return f
+
+
+def hardware_block(cfg, mode="poll", bmc=None):
+    """
+    The `hardware` block (PROTOCOL.md). mode:
+      poll   kernel sensors fresh, GPU fresh (10 s cache), one stale SMART drive,
+             BMC from cache (snapshot refreshes it separately)
+      brief  kernel sensors fresh, everything else from cache
+      full   every source fresh, every stale SMART drive
+    """
+    hw = cfg.get("hardware") or {}
+    sources, temps, fans = {}, [], []
+    watts = None
+
+    if hw.get("sensors", True):
+        t, fns, err = kernel_sensors()
+        temps += t
+        fans += fns
+        sources["sensors"] = err
+
+    if hw.get("ipmi"):
+        if bmc is None:
+            if mode == "full":
+                detail, t2, f2, err = read_bmc(cfg)
+            else:
+                detail, t2, f2 = cached_bmc(cfg)
+                err = None
+        else:
+            detail, t2, f2, err = bmc
+        temps += t2
+        fans += f2
+        watts = (detail or {}).get("watts")
+        sources["ipmi"] = err
+
+    drives = []
+    if smart_devices(cfg):
+        drives, err = read_smart(cfg, {"poll": "stalest", "brief": "none", "full": "all"}[mode])
+        sources["smart"] = err
+
+    gpus = []
+    if hw.get("gpu"):
+        gpus, err = read_gpu(cfg, fresh=(mode != "brief"))
+        sources["gpu"] = err
+        for g in gpus:
+            if g.get("celsius") is not None:
+                temps.append({"label": g["name"] if len(gpus) == 1 else f"GPU {g['index']}",
+                              "group": "gpu", "celsius": g["celsius"], "warn": None, "crit": None,
+                              "status": None, "source": "gpu"})
+    kernel_drives = " ".join(t["label"] for t in temps if t["group"] == "drive" and t["source"] == "sensors")
+    for d in drives:
+        dev = os.path.basename(d["device"].split(" ")[0])
+        if d.get("celsius") is not None and dev not in kernel_drives:
+            temps.append({"label": d.get("model") or d["device"], "group": "drive", "celsius": float(d["celsius"]),
+                          "warn": None, "crit": None, "status": None, "source": "smart"})
+
+    return {
+        "model": model(cfg),
+        "sources": sources,
+        "temps": _apply_thresholds(cfg, temps),
+        "fans": fans,
+        "watts": watts,
+        "drives": drives,
+        "gpus": gpus,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# checks
+# --------------------------------------------------------------------------- #
+
+def _varint(n):
+    out_ = b""
+    n &= 0xFFFFFFFF
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out_ += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out_
+
+
+def _read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        piece = sock.recv(n - len(data))
+        if not piece:
+            raise ConnectionError("connection closed early")
+        data += piece
+    return data
+
+
+def _read_varint(sock):
+    value, shift = 0, 0
+    for _ in range(5):
+        b = _read_exact(sock, 1)[0]
+        value |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return value
+        shift += 7
+    raise ValueError("varint too long")
+
+
+def _mc_text(desc):
+    if isinstance(desc, str):
+        return re.sub(r"§.", "", desc)
+    if isinstance(desc, dict):
+        return _mc_text(desc.get("text", "")) + "".join(_mc_text(x) for x in desc.get("extra", []) or [])
+    if isinstance(desc, list):
+        return "".join(_mc_text(x) for x in desc)
+    return ""
+
+
+def probe_minecraft(host, port, timeout=CHECK_TIMEOUT):
+    """The Java Edition server-list ping: handshake, status request, one JSON reply."""
+    t0 = time.monotonic()
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        hb = host.encode("utf-8")[:255]
+        hs = b"\x00" + _varint(767) + _varint(len(hb)) + hb + struct.pack(">H", port) + _varint(1)
+        s.sendall(_varint(len(hs)) + hs + b"\x01\x00")
+        _read_varint(s)                                   # packet length
+        if _read_varint(s) != 0:
+            raise ValueError("not a status reply")
+        j = json.loads(_read_exact(s, _read_varint(s)).decode("utf-8", "replace"))
+    ms = int((time.monotonic() - t0) * 1000)
+    players = j.get("players") or {}
+    return ms, {"online": players.get("online"), "max": players.get("max"),
+                "version": (j.get("version") or {}).get("name"),
+                "motd": _mc_text(j.get("description"))[:120] or None}
+
+
+def _cstr(data, i):
+    end = data.index(b"\x00", i)
+    return data[i:end].decode("utf-8", "replace"), end + 1
+
+
+def probe_a2s(host, port, timeout=CHECK_TIMEOUT):
+    """Valve's A2S_INFO over UDP, with the challenge round newer servers ask for."""
+    t0 = time.monotonic()
+    req = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00"
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+    addr = infos[0][4]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(req, addr)
+        data, _ = s.recvfrom(4096)
+        if len(data) >= 9 and data[4] == 0x41:            # S2C_CHALLENGE
+            s.sendto(req + data[5:9], addr)
+            data, _ = s.recvfrom(4096)
+    ms = int((time.monotonic() - t0) * 1000)
+    if len(data) < 6 or data[4] != 0x49:
+        raise ValueError("not an A2S_INFO reply")
+    i = 6
+    name, i = _cstr(data, i)
+    map_, i = _cstr(data, i)
+    _folder, i = _cstr(data, i)
+    _game, i = _cstr(data, i)
+    i += 2                                                # app id
+    online, max_ = data[i], data[i + 1]
+    i += 7                                                # players, max, bots, type, env, visibility, vac
+    version = None
+    try:
+        version, i = _cstr(data, i)
+    except ValueError:
+        pass
+    return ms, {"online": online, "max": max_, "map": map_ or None, "name": name or None, "version": version}
+
+
+def probe_http(spec, timeout=CHECK_TIMEOUT):
+    url = spec["url"]
+    u = urllib.parse.urlsplit(url)
+    https = u.scheme == "https"
+    host = u.hostname or ""
+    port = u.port or (443 if https else 80)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    t0 = time.monotonic()
+    if https:
+        ctx = ssl.create_default_context()
+        if spec.get("insecure"):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("GET", path, headers={"User-Agent": f"sentinel-agent/{VERSION}", "Accept": "*/*"})
+        cert_days = None
+        if https and conn.sock is not None:
+            cert = conn.sock.getpeercert()
+            if cert and cert.get("notAfter"):
+                cert_days = int((ssl.cert_time_to_seconds(cert["notAfter"]) - time.time()) // 86400)
+        resp = conn.getresponse()
+        body = resp.read(262144) if spec.get("contains") else b""
+        code = resp.status
+    finally:
+        conn.close()
+    ms = int((time.monotonic() - t0) * 1000)
+    expect = spec.get("expect")
+    if isinstance(expect, list) and expect:
+        up = code in expect
+    else:
+        up = 200 <= code < 400
+    error = None if up else f"HTTP {code}"
+    if up and spec.get("contains") and str(spec["contains"]).encode() not in body:
+        up, error = False, "the expected text is not on the page"
+    if cert_days is not None and cert_days < 0:
+        up, error = False, "the certificate has expired"
+    return ms, {"code": code, "cert_days": cert_days}, up, error
+
+
+def _describe(e):
+    if isinstance(e, ssl.SSLCertVerificationError):
+        return f"certificate: {e.verify_message or e}"
+    if isinstance(e, socket.timeout) or "timed out" in str(e):
+        return "timed out"
+    if isinstance(e, ConnectionRefusedError):
+        return "connection refused"
+    if isinstance(e, socket.gaierror):
+        return "name not found"
+    return str(e)[:200] or type(e).__name__
+
+
+def _split_target(spec):
+    host = str(spec.get("host") or "127.0.0.1")
+    port = spec.get("port")
+    if not isinstance(port, int):
+        raise ValueError("port must be a number")
+    return host, port
+
+
+def run_check(spec):
+    """One probe -> a check result (without the controls, which come from config)."""
+    kind = spec.get("kind")
+    base = {"key": spec["key"], "kind": kind, "label": spec.get("label") or spec["key"],
+            "up": False, "state": "down", "ms": None, "error": None, "hint": None, "detail": {},
+            "checked": int(time.time())}
+    try:
+        if kind == "http":
+            base["target"] = spec.get("url")
+            ms, detail, up, error = probe_http(spec)
+            base.update(ms=ms, detail=detail, up=up, error=error)
+        elif kind == "tcp":
+            host, port = _split_target(spec)
+            base["target"] = f"{host}:{port}"
+            t0 = time.monotonic()
+            with socket.create_connection((host, port), timeout=CHECK_TIMEOUT):
+                pass
+            base.update(ms=int((time.monotonic() - t0) * 1000), up=True)
+        elif kind == "minecraft":
+            host, port = _split_target(spec)
+            base["target"] = f"{host}:{port}"
+            ms, detail = probe_minecraft(host, port)
+            base.update(ms=ms, detail=detail, up=True)
+        elif kind == "a2s":
+            host, port = _split_target(spec)
+            base["target"] = f"{host}:{port}"
+            ms, detail = probe_a2s(host, port)
+            base.update(ms=ms, detail=detail, up=True)
+            if not spec.get("label") and detail.get("name"):
+                base["label"] = detail["name"]
+        else:
+            base["error"] = f"unknown check kind {kind!r}"
+    except Exception as e:                                    # noqa: BLE001
+        base["error"] = _describe(e)
+    base["state"] = "up" if base["up"] else "down"
+    return base
+
+
+def check_specs(cfg):
+    """The configured checks, each with a unique key, invalid ones dropped."""
+    seen, specs = set(), []
+    for i, ch in enumerate(cfg.get("checks") or []):
+        if not isinstance(ch, dict) or ch.get("kind") not in ("http", "tcp", "minecraft", "a2s", "dashboard"):
+            continue
+        key = str(ch.get("key") or "")
+        if not KEY_RE.fullmatch(key):
+            hint = ch.get("url") or ch.get("host") or ch.get("kind")
+            key = re.sub(r"[^a-z0-9_-]+", "-", str(hint).lower().split("//")[-1]).strip("-")[:28] or f"check{i}"
+        while key in seen:
+            key = f"{key[:28]}-{i}"
+        seen.add(key)
+        if ch["kind"] == "http":
+            if not isinstance(ch.get("url"), str) or not ch["url"].startswith(("http://", "https://")):
+                continue
+        specs.append(dict(ch, key=key))
+    return specs
+
+
+def dashboard(cfg):
+    """The first dashboard check's snapshot, or (None, None) when there is none."""
+    spec = next((ch for ch in check_specs(cfg) if ch["kind"] == "dashboard"), None)
+    if not spec:
+        return None, None, None
+    try:
+        with urllib.request.urlopen(spec["url"], timeout=4) as r:
+            return spec, json.loads(r.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        return spec, None, f"status service HTTP {e.code}"
+    except Exception as e:                                    # noqa: BLE001
+        return spec, None, f"status service unreachable: {e}"
+
+
+def dashboard_checks(spec, snap):
+    """A dashboard's games and sites, as checks."""
+    out_ = []
+    for g in (snap or {}).get("games", []) or []:
+        if not isinstance(g, dict) or not KEY_RE.fullmatch(str(g.get("key") or "")):
+            continue
+        state = g.get("state") or ("up" if g.get("up") else "down")
+        out_.append({
+            "key": g["key"], "kind": "game", "label": g.get("label") or g["key"],
+            "target": g.get("join"), "up": bool(g.get("up")), "state": state,
+            "ms": g.get("latencyMs"), "error": g.get("error"), "hint": g.get("hint"),
+            "detail": {k: g.get(k) for k in ("online", "max", "version", "map", "motd", "join") if g.get(k) is not None},
+            "uptime": g.get("uptime"), "checked": int(time.time()), "source": spec["key"],
+        })
+    for s in (snap or {}).get("sites", []) or []:
+        if not isinstance(s, dict) or not s.get("key"):
+            continue
+        key = re.sub(r"[^a-z0-9_-]+", "-", str(s["key"]).lower())[:32]
+        out_.append({
+            "key": key, "kind": "site", "label": s.get("label") or key, "target": s.get("url"),
+            "up": bool(s.get("ok")), "state": "up" if s.get("ok") else "down",
+            "ms": s.get("latencyMs"), "error": s.get("error"), "hint": None, "detail": {},
+            "uptime": s.get("uptime"), "checked": int(time.time()), "source": spec["key"],
+        })
+    return out_
+
+
+def all_checks(cfg, refresh=True, dash=None):
+    """Every check: probes reused for checks_interval_s, refreshed concurrently."""
+    specs = [s for s in check_specs(cfg) if s["kind"] != "dashboard"]
+    cached = cache_get("checks")
+    now = time.time()
+    interval = max(10, int(cfg.get("checks_interval_s") or 60))
+    stale = [s for s in specs if refresh and now - (cached.get(s["key"]) or {}).get("checked", 0) >= interval]
+    if stale:
+        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+            fresh = list(pool.map(run_check, stale))
+        cached = cache_merge("checks", {r["key"]: r for r in fresh})
+    results = []
+    for s in specs:
+        r = cached.get(s["key"])
+        if r is None:
+            r = {"key": s["key"], "kind": s["kind"], "label": s.get("label") or s["key"], "up": False,
+                 "state": "down", "ms": None, "error": "not checked yet", "hint": None, "detail": {},
+                 "checked": 0}
+        r = dict(r)
+        if s.get("label"):
+            r["label"] = s["label"]
+        results.append(r)
+
+    if dash is None:
+        dash = dashboard(cfg)
+    spec, snap, _err = dash
+    if spec:
+        results += dashboard_checks(spec, snap)
+
+    for r in results:
+        verbs, container, hints = check_control(cfg, r["key"])
+        r["controls"] = verbs
+        r["container"] = container
+        r["hints"] = hints
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# controls
+# --------------------------------------------------------------------------- #
+
+def is_lifeline(unit):
+    return bool(LIFELINE_RE.fullmatch(unit or ""))
+
+
+def control_units(cfg):
+    if not cfg.get("allow_control"):
+        return []
+    watched = set(cfg["units"])
+    return [u for u in (cfg.get("control") or {}).get("units", []) or []
+            if isinstance(u, str) and UNIT_RE.fullmatch(u) and u in watched]
+
+
+def check_container_names(cfg):
+    """Containers a check runs in: never started, stopped or restarted bare."""
+    names = set()
+    for spec in check_control_specs(cfg).values():
+        c = spec.get("container")
+        if isinstance(c, str) and CONTAINER_RE.fullmatch(c):
+            names.add(c)
+    return names
+
+
+def control_containers(cfg):
+    if not cfg.get("allow_control"):
+        return []
+    watched = set(cfg["containers"])
+    guarded = check_container_names(cfg)
+    return [c for c in (cfg.get("control") or {}).get("containers", []) or []
+            if isinstance(c, str) and CONTAINER_RE.fullmatch(c) and c in watched and c not in guarded]
+
+
+def unit_verbs(unit):
+    return ["restart"] if is_lifeline(unit) else list(ACTIONS)
+
+
+def _valid_command(argv):
+    """A command from the config is held to what can go into a sudo rule safely:
+    an absolute path to a root-owned file nobody else can write, plain words."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return False
+    if not argv[0].startswith("/") or not all(SAFE_ARG_RE.fullmatch(a) for a in argv):
+        return False
+    try:
+        st = os.stat(argv[0])
+    except OSError:
+        return False
+    return st.st_uid == 0 and not (st.st_mode & 0o022)
+
+
+def check_control_specs(cfg):
+    """{check key: control spec}, from each check's own `control` and a
+    dashboard check's `controls` map (agent 1.x called that map `games`)."""
+    specs = {}
+    for ch in check_specs(cfg):
+        if ch["kind"] == "dashboard":
+            for k, v in (ch.get("controls") or {}).items():
+                if KEY_RE.fullmatch(str(k)) and isinstance(v, dict):
+                    specs[str(k)] = v
+        elif isinstance(ch.get("control"), dict):
+            specs[ch["key"]] = ch["control"]
+    return specs
+
+
+def check_control(cfg, key):
+    """(verbs, container, hints) a check may be controlled with; verbs empty without control."""
+    spec = check_control_specs(cfg).get(key)
+    if not isinstance(spec, dict):
+        return [], None, {}
+    container = spec.get("container") if isinstance(spec.get("container"), str) and CONTAINER_RE.fullmatch(spec["container"]) else None
+    hints = {k: str(v)[:160] for k, v in (spec.get("hints") or {}).items() if k in CHECK_VERBS}
+    if not cfg.get("allow_control"):
+        return [], container, hints
+    unit = spec.get("unit")
+    if isinstance(unit, str) and UNIT_RE.fullmatch(unit) and unit in cfg["units"]:
+        verbs = ["restart"] if is_lifeline(unit) else sorted(UNIT_CHECK_VERBS)
+        return verbs, container, hints
+    cmds = spec.get("commands")
+    if isinstance(cmds, dict):
+        verbs = sorted(v for v, argv in cmds.items() if v in CHECK_VERBS and _valid_command(argv))
+        return verbs, container, hints
+    return [], container, hints
+
+
+def protocol1_controls(cfg):
+    """{key: [verbs]} for the protocol-1 app's Games tab."""
+    out_ = {}
+    for key in sorted(check_control_specs(cfg)):
+        verbs, _c, _h = check_control(cfg, key)
+        if verbs:
+            out_[key] = verbs
+    return out_
+
+
+# --------------------------------------------------------------------------- #
+# subcommands
+# --------------------------------------------------------------------------- #
+
+def _base(cfg):
+    return {"ok": True, "version": VERSION, "protocol": PROTOCOL, "time": int(time.time()),
+            "control": bool(cfg.get("allow_control")), "controls": protocol1_controls(cfg),
+            "control_units": control_units(cfg), "control_containers": control_containers(cfg)}
+
+
+def cmd_ping(cfg, _args):
+    r = _base(cfg)
+    rows, _err = docker_ps(cfg) if cfg["containers"] else ({}, None)
+    r.update({
+        "hostname": socket.gethostname(),
+        "units": list(cfg["units"]),
+        "containers": list(cfg["containers"]),
+        "features": features(cfg),
+        "model": model(cfg),
+        "unwatched": len([n for n in (rows or {}) if n not in set(cfg["containers"])]),
+    })
+    return r
+
+
+def _p1_hw(cfg, dash_snap, bmc):
+    """The protocol-1 `hw` summary: a dashboard's, else the BMC's, else none."""
+    if dash_snap and isinstance(dash_snap.get("hw"), dict):
+        return summarize_status_hw(dash_snap["hw"]), None, "status"
+    if bmc and bmc[0]:
+        return summarize_bmc(bmc[0]), None, "bmc"
+    if bmc and bmc[3]:
+        return None, bmc[3], None
+    return None, None, None
+
+
+def _snapshot(cfg, brief):
+    spec, dash_snap, dash_err = dashboard(cfg)
+    hw_cfg = cfg.get("hardware") or {}
+    bmc = None
+    if hw_cfg.get("ipmi"):
+        if brief:
+            d, t2, f2 = cached_bmc(cfg)
+            bmc = (d, t2, f2, None)
+        elif dash_snap and isinstance(dash_snap.get("hw"), dict) and spec.get("hardware"):
+            # One BMC, one poller: the dashboard already reads it on its own timer.
+            bmc = dashboard_bmc(dash_snap["hw"])
+        else:
+            bmc = read_bmc(cfg)
+    hw1, hw1_err, hw1_src = _p1_hw(cfg, dash_snap if (spec or {}).get("hardware") else None, bmc)
+    docker, unwatched = containers(cfg, cfg["containers"], stats=not brief)
+    r = _base(cfg)
+    r.update({
+        "unwatched": unwatched,
+        "host": host_block(rates=not brief),
+        "hardware": hardware_block(cfg, "brief" if brief else "poll", bmc=bmc),
+        "hw": hw1,
+        "hw_error": hw1_err,
+        "hw_source": hw1_src,
+        "services": services(cfg, cfg["units"]),
+        "docker": docker,
+        "games": (dash_snap or {}).get("games", []),
+        "sites": (dash_snap or {}).get("sites", []),
+        "status_error": dash_err if spec else None,
+    })
+    if brief:
+        r["checks"] = all_checks(cfg, refresh=True, dash=(spec, dash_snap, dash_err))
+    return r
+
+
+def cmd_snapshot(cfg, _args):
+    return _snapshot(cfg, brief=False)
+
+
+def cmd_brief(cfg, _args):
+    return _snapshot(cfg, brief=True)
+
+
+def cmd_checks(cfg, _args):
+    return {"ok": True, "checks": all_checks(cfg, refresh=True)}
+
+
+def cmd_hw(cfg, _args):
+    hw_cfg = cfg.get("hardware") or {}
+    bmc = read_bmc(cfg) if hw_cfg.get("ipmi") else None
+    hardware = hardware_block(cfg, "full", bmc=bmc)
+    return {"ok": True, "hw": bmc[0] if bmc else None, "age_s": 0,
+            "error": bmc[3] if bmc else None, "hardware": hardware, "sel": bool(hw_cfg.get("ipmi"))}
+
+
+def cmd_sel(cfg, args):
+    if not (cfg.get("hardware") or {}).get("ipmi"):
+        return {"ok": False, "events": [], "error": "this server has no BMC"}
+    limit = 25
+    if args:
+        if not args[0].isdigit():
+            return {"ok": False, "error": "sel: count must be a number"}
+        limit = max(1, min(SEL_TAIL, int(args[0])))
+    events, err = read_sel(cfg, limit)
+    return {"ok": events is not None, "events": events or [], "error": err}
+
+
+def journal_argv(cfg, unit):
+    return [path_of(cfg, "journalctl"), "-u", unit, "-n", str(LOG_TAIL), "--no-pager", "-o", "short-iso"]
+
+
+def cmd_logs(cfg, args):
+    if not args:
+        return {"ok": False, "error": "logs: unit required"}
+    unit = args[0]
+    lines = 120
+    if len(args) > 1:
+        if not args[1].isdigit():
+            return {"ok": False, "error": "logs: line count must be a number"}
+        lines = max(1, min(cfg["max_log_lines"], LOG_TAIL, int(args[1])))
+    if not UNIT_RE.fullmatch(unit) or unit not in cfg["units"]:
+        return {"ok": False, "error": f"logs: {unit!r} is not a watched unit"}
+    argv = journal_argv(cfg, unit)
+    # Through sudo, so an account outside the journal groups can still read the
+    # watched units; an account inside them (agent 1.x installs) needs no rule.
+    rc, so, se = run(["sudo", "-n", *argv], timeout=20)
+    if rc != 0 and _sudo_refused(se):
+        rc, so, se = run(argv, timeout=20)
+    if rc != 0:
+        return {"ok": False, "error": (se.strip() or f"journalctl exited {rc}")[:300]}
+    return {"ok": True, "unit": unit, "lines": so.splitlines()[-lines:]}
+
+
+def cmd_dlogs(cfg, args):
+    if not args:
+        return {"ok": False, "error": "dlogs: container required"}
+    name = args[0]
+    lines = 120
+    if len(args) > 1:
+        if not args[1].isdigit():
+            return {"ok": False, "error": "dlogs: line count must be a number"}
+        lines = max(1, min(cfg["max_log_lines"], LOG_TAIL, int(args[1])))
+    if not CONTAINER_RE.fullmatch(name) or name not in cfg["containers"]:
+        return {"ok": False, "error": f"dlogs: {name!r} is not a watched container"}
+    rc, so, se = sudo(cfg, "docker", "logs", "--tail", str(LOG_TAIL), "--timestamps", name, timeout=25)
+    if rc != 0:
+        return {"ok": False, "error": (se.strip() or f"docker exited {rc}")[:300]}
+    return {"ok": True, "container": name, "lines": (so + se).splitlines()[-lines:]}
+
+
+def cmd_action(cfg, args):
+    if not cfg.get("allow_control"):
+        return {"ok": False, "error": "control is disabled on this agent"}
+    if len(args) < 2:
+        return {"ok": False, "error": "action: <start|stop|restart> <unit>"}
+    verb, unit = args[0], args[1]
+    if verb not in ACTIONS:
+        return {"ok": False, "error": f"action: {verb!r} is not one of {'/'.join(ACTIONS)}"}
+    if not UNIT_RE.fullmatch(unit) or unit not in control_units(cfg):
+        return {"ok": False, "error": f"action: {unit!r} is not a controllable unit"}
+    if verb not in unit_verbs(unit):
+        return {"ok": False, "error": f"{unit} can only be restarted from the app: stopping it could cut off the way back in"}
+    rc, _so, se = sudo(cfg, "systemctl", verb, unit, timeout=90)
+    if rc != 0:
+        return {"ok": False, "error": (se.strip() or f"systemctl exited {rc}")[:300]}
+    time.sleep(1.0)                      # let the state settle before reporting it back
+    return {"ok": True, "unit": unit, "verb": verb, "state": services(cfg, [unit])}
+
+
+def cmd_daction(cfg, args):
+    if not cfg.get("allow_control"):
+        return {"ok": False, "error": "control is disabled on this agent"}
+    if len(args) < 2:
+        return {"ok": False, "error": "daction: <start|stop|restart> <container>"}
+    verb, name = args[0], args[1]
+    if verb not in ACTIONS:
+        return {"ok": False, "error": f"daction: {verb!r} is not one of {'/'.join(ACTIONS)}"}
+    if CONTAINER_RE.fullmatch(name) and name in check_container_names(cfg):
+        return {"ok": False, "error": f"{name} is run by one of the checks: use its controls instead"}
+    if not CONTAINER_RE.fullmatch(name) or name not in control_containers(cfg):
+        return {"ok": False, "error": f"daction: {name!r} is not a controllable container"}
+    rc, _so, se = sudo(cfg, "docker", verb, name, timeout=120)
+    if rc != 0:
+        return {"ok": False, "error": (se.strip() or f"docker exited {rc}")[:300]}
+    return {"ok": True, "container": name, "verb": verb}
+
+
+def cmd_check(cfg, args):
+    if not cfg.get("allow_control"):
+        return {"ok": False, "error": "control is disabled on this agent"}
+    if len(args) < 2:
+        return {"ok": False, "error": "check: <verb> <key>"}
+    verb, key = args[0], args[1]
+    if not KEY_RE.fullmatch(key or ""):
+        return {"ok": False, "error": f"check: {key!r} is not a check"}
+    verbs, _container, _hints = check_control(cfg, key)
+    if verb not in verbs:
+        return {"ok": False, "error": f"check: {key} cannot {verb!r}"}
+    spec = check_control_specs(cfg)[key]
+    unit = spec.get("unit")
+    if isinstance(unit, str):
+        rc, so, se = sudo(cfg, "systemctl", *UNIT_CHECK_VERBS[verb], unit, timeout=120)
+        if rc != 0:
+            if _sudo_refused(se):
+                return {"ok": False, "error": "sudo refused it: re-run the Sentinel installer on the server"}
+            return {"ok": False, "error": _last_line(se, so) or f"systemctl exited {rc}"}
+        time.sleep(1.0)
+        return {"ok": True, "game": key, "check": key, "verb": verb, "state": services(cfg, [unit])}
+    argv = spec["commands"][verb]
+    # A save, a clean stop and a restart can take minutes (a game server that
+    # saves first), so the wait is long; the app waits a little longer still.
+    rc, so, se = run(["sudo", "-n", *argv], timeout=480)
+    said = _last_line(so, se)
+    if rc != 0:
+        if _sudo_refused(se):
+            return {"ok": False, "error": f"sudo refused {os.path.basename(argv[0])}: re-run the Sentinel installer"}
+        return {"ok": False, "error": said or f"{os.path.basename(argv[0])} exited {rc}"}
+    return {"ok": True, "game": key, "check": key, "verb": verb, "detail": said}
+
+
+COMMANDS = {
+    "ping": cmd_ping,
+    "snapshot": cmd_snapshot,
+    "brief": cmd_brief,
+    "checks": cmd_checks,
+    "hw": cmd_hw,
+    "sel": cmd_sel,
+    "logs": cmd_logs,
+    "dlogs": cmd_dlogs,
+    "action": cmd_action,
+    "daction": cmd_daction,
+    "check": cmd_check,
+    "game": cmd_check,              # protocol 1's name
+}
+
+
+# --------------------------------------------------------------------------- #
+# the sudo rules
+# --------------------------------------------------------------------------- #
+
+def sudo_escape(arg):
+    """One argument as sudoers needs it: , : = and \\ are special inside a
+    Cmnd and must be backslashed (megaraid,0 would otherwise split the rule in
+    two), and an empty argument list is written "" — a bare path means "with
+    any arguments at all"."""
+    return "".join("\\" + ch if ch in "\\,:=" else ch for ch in arg)
+
+
+def sudo_command(argv):
+    path, args = argv[0], argv[1:]
+    return sudo_escape(path) + " " + (" ".join(sudo_escape(a) for a in args) if args else '""')
+
+
+def sudo_argvs(cfg):
+    """Every argv this agent will ever pass to sudo, for this config, labelled."""
+    rules = []
+    hw = cfg.get("hardware") or {}
+    if cfg["containers"]:
+        rules.append(("read", [path_of(cfg, "docker"), *DOCKER_PS]))
+        rules.append(("read", [path_of(cfg, "docker"), *DOCKER_STATS]))
+        for c in cfg["containers"]:
+            if CONTAINER_RE.fullmatch(c):
+                rules.append(("read", [path_of(cfg, "docker"), "logs", "--tail", str(LOG_TAIL), "--timestamps", c]))
+    for u in cfg["units"]:
+        if UNIT_RE.fullmatch(u):
+            rules.append(("read", journal_argv(cfg, u)))
+    if hw.get("ipmi"):
+        rules.append(("read", [path_of(cfg, "ipmitool"), "sdr", "elist"]))
+        rules.append(("read", [path_of(cfg, "ipmitool"), "sel", "elist", "last", str(SEL_TAIL)]))
+    for dev, typ in smart_devices(cfg):
+        rules.append(("read", smart_argv(cfg, dev, typ)))
+    if cfg.get("allow_control"):
+        for u in control_units(cfg):
+            for verb in unit_verbs(u):
+                rules.append(("control", [path_of(cfg, "systemctl"), verb, u]))
+        for c in control_containers(cfg):
+            for verb in ACTIONS:
+                rules.append(("control", [path_of(cfg, "docker"), verb, c]))
+        for key, spec in sorted(check_control_specs(cfg).items()):
+            verbs, _c, _h = check_control(cfg, key)
+            unit = spec.get("unit")
+            for verb in verbs:
+                if isinstance(unit, str):
+                    rules.append(("control", [path_of(cfg, "systemctl"), *UNIT_CHECK_VERBS[verb], unit]))
+                else:
+                    rules.append(("control", list(spec["commands"][verb])))
+    seen, unique = set(), []
+    for kind, argv in rules:
+        t = tuple(argv)
+        if t not in seen:
+            seen.add(t)
+            unique.append((kind, argv))
+    return unique
+
+
+def _sudo_version():
+    rc, so, _ = run(["sudo", "-V"], timeout=5)
+    m = re.search(r"Sudo version (\d+)\.(\d+)\.(\d+)", so or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def sudoers_text(cfg, user, quiet_logs=None):
+    """The whole drop-in for /etc/sudoers.d/sentinel-agent."""
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user or ""):
+        raise ValueError(f"not a user name sudoers can hold: {user!r}")
+    rules = sudo_argvs(cfg)
+    reads = [sudo_command(a) for k, a in rules if k == "read"]
+    controls = [sudo_command(a) for k, a in rules if k == "control"]
+    lines = [
+        "# Written by sentinel-agent --sudoers. Do not edit: re-run the Sentinel installer instead.",
+        "# Each entry is one exact command line the agent runs; nothing else is allowed.",
+    ]
+    if reads:
+        lines.append("Cmnd_Alias SENTINEL_READ = " + ", \\\n    ".join(reads))
+        lines.append(f"{user} ALL=(root) NOPASSWD: SENTINEL_READ")
+    if controls:
+        lines.append("Cmnd_Alias SENTINEL_CONTROL = " + ", \\\n    ".join(controls))
+        lines.append(f"{user} ALL=(root) NOPASSWD: SENTINEL_CONTROL")
+    if quiet_logs is None:
+        quiet_logs = _sudo_version() >= (1, 9, 8)
+    if reads and quiet_logs:
+        # The app reads every few seconds. Logging each of those would bury
+        # everything else in the auth log; control actions are still logged.
+        lines.append("Defaults!SENTINEL_READ !log_allowed, !pam_session")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# detection (run by the installer, as root)
+# --------------------------------------------------------------------------- #
+
+# Services worth watching on any server, whatever systemd says about them.
+KEEP_RE = re.compile(
+    r"^(ssh|sshd|docker|containerd|podman|nginx|apache2|httpd|caddy|traefik|haproxy|lighttpd|"
+    r"mysql|mysqld|mariadb|postgresql(@.+)?|mongod|redis(-server)?(@.+)?|valkey(-server)?|memcached|"
+    r"php[0-9.]*-fpm|tailscaled|cloudflared|wg-quick@.+|openvpn(-server|-client)?(@.+)?|zerotier-one|"
+    r"fail2ban|crowdsec|postfix(@.*)?|exim4|dovecot|named|bind9|unbound|pihole-FTL|adguardhome|"
+    r"jellyfin|plexmediaserver|emby-server|minecraft.*|grafana-server|prometheus|influxdb|"
+    r"gitea|forgejo|gitlab-runsvdir|nextcloud.*|home-assistant.*|mosquitto|nodered|"
+    r"libvirtd|smbd|nmbd|nfs-server)\.service$", re.I)
+
+# The operating system's own machinery: running everywhere, never what the
+# person installing a monitor means by "my services".
+DROP_RE = re.compile(
+    r"^(systemd-.*|dbus(-broker)?|getty@.*|serial-getty@.*|autovt@.*|user@.*|user-runtime-dir@.*|"
+    r"polkit|polkitd|accounts-daemon|rtkit-daemon|udisks2|upower|packagekit|fwupd|"
+    r"ModemManager|NetworkManager.*|wpa_supplicant|iwd|bluetooth|avahi-daemon|cups.*|colord|"
+    r"multipathd|irqbalance|rsyslog|syslog-ng|cron|crond|cronie|anacron|atd|auditd|apparmor|"
+    r"snapd|snapd\..*|snap\..*|unattended-upgrades|packagekit-offline-update|apt-daily.*|"
+    r"thermald|power-profiles-daemon|switcheroo-control|tuned|ksmtuned|irqbalance|mcelog|"
+    r"chrony|chronyd|ntp|ntpd|ntpsec|haveged|rngd|smartd|smartmontools|lvm2-.*|mdmonitor|"
+    r"blk-availability|iscsid|open-iscsi|rpcbind|gssproxy|nfs-.*client.*|lxcfs|lxd.*|"
+    r"qemu-guest-agent|open-vm-tools|vmtoolsd|vgauth|hv-.*|hyperv-.*|spice-vdagentd|"
+    r"cloud-init.*|cloud-config|cloud-final|google-.*|amazon-ssm-agent|walinuxagent|waagent|"
+    r"droplet-agent|do-agent|oracle-cloud-agent|hetzner-.*|"
+    r"gdm|gdm3|lightdm|sddm|display-manager|gnome-.*|kerneloops|whoopsie|apport|"
+    r"plymouth.*|console-setup|keyboard-setup|setvtrgb|"
+    r"triggerhappy|hciuart|rpi-.*|dphys-swapfile|raspi-config|rpi-eeprom-update|"
+    r"networkd-dispatcher|ufw|nftables|firewalld|netplan-.*|ifup@.*|"
+    r"sentinel-.*)\.service$", re.I)
+
+
+def classify_units(show_text):
+    """`systemctl show -p Id,Type,UnitFileState,FragmentPath` of the running
+    services -> the ones to watch, in order."""
+    keep = []
+    for b in _show_blocks(show_text):
+        uid = b.get("Id", "")
+        if not uid.endswith(".service") or not UNIT_RE.fullmatch(uid):
+            continue
+        if KEEP_RE.fullmatch(uid):
+            keep.append(uid)
+            continue
+        if DROP_RE.fullmatch(uid):
+            continue
+        typ = b.get("Type", "")
+        state = b.get("UnitFileState", "")
+        frag = b.get("FragmentPath", "")
+        if typ == "oneshot":
+            continue
+        # An instance of a template (foo@bar) usually comes and goes on its own:
+        # watching one would raise an alarm every time it leaves.
+        if "@" in uid:
+            continue
+        admin_made = frag.startswith(("/etc/systemd/system/", "/usr/local/"))
+        if admin_made or state in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
+            keep.append(uid)
+    return keep
+
+
+def postgres_clusters(units, all_units):
+    """Debian's postgresql.service is a oneshot that is always 'active'; the
+    clusters themselves are postgresql@<ver>-<name>."""
+    if "postgresql.service" not in units:
+        return units
+    clusters = [u for u in all_units if re.fullmatch(r"postgresql@[0-9.]+-[A-Za-z0-9_]+\.service", u)]
+    out_ = [u for u in units if u != "postgresql.service"]
+    return out_ + [c for c in clusters if c not in out_] if clusters else units
+
+
+def which(name, extra=("/usr/sbin", "/sbin", "/usr/local/sbin", "/snap/bin")):
+    for d in os.environ.get("PATH", "").split(os.pathsep) + list(extra):
+        p = os.path.join(d, name)
+        if d and os.path.isfile(p) and os.access(p, os.X_OK):
+            # /bin/systemctl -> /usr/bin/systemctl is the same program; snap's
+            # /snap/bin/docker -> /usr/bin/snap is not, and must keep its name.
+            real = os.path.realpath(p)
+            return real if os.path.basename(real) == name else p
+    return None
+
+
+def parse_smart_scan(text):
+    """`smartctl --scan-open` -> [{"dev": ..., "type": ...}] for drives it could open."""
+    devs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        body, _, comment = line.partition("#")
+        if "failed" in comment.lower() or "open failed" in line.lower():
+            continue
+        f = body.split()
+        if not f or not f[0].startswith("/dev/"):
+            continue
+        typ = f[f.index("-d") + 1] if "-d" in f and f.index("-d") + 1 < len(f) else None
+        entry = {"dev": f[0], "type": typ}
+        if SAFE_ARG_RE.fullmatch(entry["dev"]) and (typ is None or SAFE_ARG_RE.fullmatch(typ)):
+            devs.append(entry)
+    return devs
+
+
+def detect_paths():
+    paths = {}
+    for tool in ("systemctl", "journalctl", "docker", "ipmitool", "smartctl", "nvidia-smi", "systemd-detect-virt"):
+        p = which(tool)
+        if p:
+            paths[tool] = p
+    return paths
+
+
+def detect_hardware(paths, notes):
+    temps, fans, _ = kernel_sensors()
+    hardware = {"sensors": bool(temps or fans), "ipmi": False, "smart": [], "gpu": False}
+    if paths.get("ipmitool") and any(os.path.exists(p) for p in ("/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0")):
+        rc, so, _ = run([paths["ipmitool"], "sdr", "elist"], timeout=30)
+        hardware["ipmi"] = rc == 0 and bool(so.strip())
+    if paths.get("smartctl"):
+        rc, so, _ = run([paths["smartctl"], "--scan-open"], timeout=30)
+        hardware["smart"] = parse_smart_scan(so)
+    else:
+        notes.append("smartmontools is not installed: install it and re-run with --detect for drive health")
+    if paths.get("nvidia-smi"):
+        rc, _so, _ = run([paths["nvidia-smi"], "-L"], timeout=10)
+        hardware["gpu"] = rc == 0
+    return hardware
+
+
+def detect():
+    """What this server has: services, containers, hardware, tool paths."""
+    notes = []
+    paths = detect_paths()
+    systemctl = paths.get("systemctl", "systemctl")
+
+    rc, so, _ = run([systemctl, "list-units", "--type=service", "--state=running", "--no-legend", "--plain"], timeout=20)
+    running = [ln.split()[0] for ln in so.splitlines() if ln.strip()] if rc == 0 else []
+    rc, so2, _ = run([systemctl, "list-units", "--type=service", "--state=failed", "--no-legend", "--plain"], timeout=20)
+    failed = [ln.split()[0] for ln in so2.splitlines() if ln.strip()] if rc == 0 else []
+    names = [u for u in dict.fromkeys(running + failed) if UNIT_RE.fullmatch(u)]
+    units = []
+    if names:
+        rc, show, _ = run([systemctl, "show", "-p", "Id,Type,UnitFileState,FragmentPath", *names], timeout=30)
+        units = classify_units(show) if rc == 0 else []
+    rc, so3, _ = run([systemctl, "list-units", "--type=service", "--all", "--no-legend", "--plain"], timeout=20)
+    all_units = [ln.split()[0] for ln in so3.splitlines() if ln.strip()] if rc == 0 else []
+    units = postgres_clusters(units, all_units)
+
+    containers_ = []
+    if paths.get("docker"):
+        rc, so, se = run([paths["docker"], "ps", "-a", "--format", "{{.Names}}\t{{.State}}"], timeout=20)
+        if rc == 0:
+            for line in so.splitlines():
+                name, _, state = line.partition("\t")
+                if not CONTAINER_RE.fullmatch(name):
+                    continue
+                if state == "running":
+                    containers_.append(name)
+                    continue
+                rc2, pol, _ = run([paths["docker"], "inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", name], timeout=10)
+                if rc2 == 0 and pol.strip() in ("always", "unless-stopped", "on-failure"):
+                    containers_.append(name)
+        else:
+            notes.append(f"docker: {_last_line(se)}")
+
+    hardware = detect_hardware(paths, notes)
+    return {"units": units, "containers": containers_, "hardware": hardware, "paths": paths, "notes": notes}
+
+
+def parse_check_arg(text):
+    """--check forms: a URL, host:port, minecraft:host:port, a2s:host:port."""
+    text = text.strip()
+    if text.startswith(("http://", "https://")):
+        host = urllib.parse.urlsplit(text).hostname or "site"
+        return {"kind": "http", "url": text, "label": host}
+    kind = "tcp"
+    m = re.fullmatch(r"(minecraft|a2s):(.+)", text)
+    if m:
+        kind, text = m.group(1), m.group(2)
+    host, _, port = text.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(f"--check {text!r}: use a URL, host:port, minecraft:host:port or a2s:host:port")
+    return {"kind": kind, "host": host, "port": int(port)}
+
+
+def write_config(path, detected, checks_add, allow_control, fresh):
+    """
+    Lay detection and flags over the config on disk; never removes anything.
+    Tool paths are refreshed every time (the sudo rules name them); hardware is
+    detected when the config has none (an agent 1.x config); services and
+    containers only on a fresh install or with --detect.
+    """
+    raw, err = _read_conf_file(path)
+    if err:
+        raise ValueError(err)
+    c = raw
+    if not fresh and "control" not in c:
+        # Agent 1.x let the app control every watched unit and container. Keep
+        # exactly that on an upgrade (lifelines still only restart): taking
+        # control away is the owner's decision, not an installer side effect.
+        c["control"] = ({"units": list(c.get("units") or []), "containers": list(c.get("containers") or [])}
+                        if c.get("allow_control") else {"units": [], "containers": []})
+    c.setdefault("paths", {}).update(detect_paths())
+    if not detected and "hardware" not in c:
+        notes = []
+        c["hardware"] = detect_hardware(c["paths"], notes)
+    if detected:
+        for k in ("units", "containers"):
+            have = c.get(k) or []
+            c[k] = have + [x for x in detected[k] if x not in have]
+        hw = c.setdefault("hardware", {})
+        for k, v in detected["hardware"].items():
+            if k == "smart":
+                have = hw.get("smart") or []
+                ids = {(d.get("dev"), d.get("type")) for d in have if isinstance(d, dict)}
+                hw["smart"] = have + [d for d in v if (d["dev"], d["type"]) not in ids]
+            elif fresh or k not in hw:
+                hw[k] = v
+            elif v:
+                hw[k] = v
+        paths = c.setdefault("paths", {})
+        paths.update(detected["paths"])
+    for ch in checks_add:
+        checks = c.setdefault("checks", [])
+        if not any(all(ch.get(k) == x.get(k) for k in ("kind", "url", "host", "port")) for x in checks):
+            checks.append(ch)
+    if allow_control is not None:
+        c["allow_control"] = allow_control
+    c.setdefault("allow_control", False)
+    c.setdefault("control", {"units": [], "containers": []})
+    ctl = c["control"]
+    if allow_control and not (ctl.get("units") or ctl.get("containers")):
+        # Turning control on with nothing listed would do nothing: start from
+        # what is watched. Lifelines stay restart-only whatever is listed here.
+        ctl["units"] = list(c.get("units") or [])
+        ctl["containers"] = list(c.get("containers") or [])
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(c, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    return c
+
+
+def admin(argv):
+    """`sentinel-agent --<verb>`: what the installer asks of the agent, as root.
+    Never reachable through the forced command, which runs with no arguments."""
+    verb = argv[0]
+    if verb == "--version":
+        print(VERSION)
+        return 0
+    if verb == "--detect":
+        print(json.dumps(detect(), indent=2))
+        return 0
+    if verb == "--sudoers":
+        user = argv[argv.index("--user") + 1] if "--user" in argv else None
+        cpath = argv[argv.index("--conf") + 1] if "--conf" in argv else CONF_PATH
+        sys.stdout.write(sudoers_text(conf(cpath), user, quiet_logs=False if "--no-quiet" in argv else None))
+        return 0
+    if verb == "--write-config":
+        cpath = argv[argv.index("--conf") + 1] if "--conf" in argv else CONF_PATH
+        fresh = not os.path.exists(cpath)
+        detected = detect() if (fresh or "--detect" in argv) else None
+        checks_add = [parse_check_arg(argv[i + 1]) for i, a in enumerate(argv) if a == "--check" and i + 1 < len(argv)]
+        allow = True if "--allow-control" in argv else (False if "--read-only" in argv else None)
+        c = write_config(cpath, detected, checks_add, allow, fresh)
+        summary = {"units": c.get("units", []), "containers": c.get("containers", []),
+                   "hardware": c.get("hardware", {}), "checks": len(c.get("checks", [])),
+                   "allow_control": c.get("allow_control"), "notes": (detected or {}).get("notes", [])}
+        print(json.dumps(summary))
+        return 0
+    print(f"unknown option {verb}", file=sys.stderr)
+    return 2
+
+
+# --------------------------------------------------------------------------- #
+
+def main():
+    # Under the forced command the request is in the environment, not argv.
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if raw is None and len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+        sys.exit(admin(sys.argv[1:]))
+    if raw is None:
+        raw = " ".join(sys.argv[1:])          # direct invocation, for testing
+    raw = (raw or "").strip() or "ping"
+
+    try:
+        parts = shlex.split(raw)
+    except ValueError as e:
+        fail(f"could not parse request: {e}")
+        return
+    if not parts:
+        fail("empty request")
+        return
+
+    verb, args = parts[0], parts[1:]
+    if len(args) > 4 or any(len(a) > 128 for a in args):
+        fail("request rejected: too many or over-long arguments")
+        return
+
+    handler = COMMANDS.get(verb)
+    if handler is None:
+        fail(f"unknown subcommand {verb!r}", allowed=sorted(COMMANDS))
+        return
+
+    cfg = conf()
+    try:
+        result = handler(cfg, args)
+    except Exception as e:                                    # noqa: BLE001
+        fail(f"{verb}: {type(e).__name__}: {e}")
+        return
+    if cfg.get("_conf_error"):
+        result["conf_error"] = cfg["_conf_error"]
+    out(result)
+
+
+if __name__ == "__main__":
+    main()

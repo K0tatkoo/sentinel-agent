@@ -1,0 +1,1 @@
+{"smartctl": {"exit_status": 8}, "model_name": "WDC WD40EFRX-68N32N0", "smart_status": {"passed": false}, "temperature": {"current": 38}, "power_on_time": {"hours": 70001}, "ata_smart_attributes": {"table": [{"id": 5, "raw": {"value": 1688}}, {"id": 197, "raw": {"value": 112}}]}}

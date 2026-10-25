@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""
+tools/build — make dist/install.sh: the installer with the agent inside it.
+
+    tools/build            # dist/install.sh + dist/SHA256SUMS
+
+One file to download and one checksum to check. The agent rides after the
+installer's __AGENT__ line as base64, and the installer checks it against the
+SHA-256 written in here before it puts anything in place.
+"""
+import base64
+import hashlib
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+agent = open(os.path.join(ROOT, "sentinel-agent"), "rb").read()
+installer = open(os.path.join(ROOT, "install.sh")).read()
+version = re.search(r'^VERSION = "([^"]+)"', agent.decode(), re.M).group(1)
+if not installer.rstrip().endswith("__AGENT__"):
+    sys.exit("install.sh must end with the __AGENT__ line")
+payload = base64.encodebytes(agent).decode()            # 76-column lines
+text = (installer.rstrip("\n").replace("@VERSION@", version)
+        .replace("@SHA256@", hashlib.sha256(agent).hexdigest()) + "\n" + payload)
+os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
+out = os.path.join(ROOT, "dist", "install.sh")
+with open(out, "w") as fh:
+    fh.write(text)
+os.chmod(out, 0o755)
+digest = hashlib.sha256(text.encode()).hexdigest()
+with open(os.path.join(ROOT, "dist", "SHA256SUMS"), "w") as fh:
+    fh.write(f"{digest}  install.sh\n")
+print(f"dist/install.sh  agent {version}  {len(text)} bytes  sha256 {digest}")

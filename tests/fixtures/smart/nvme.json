@@ -1,0 +1,1 @@
+{"smartctl": {"exit_status": 0}, "device": {"name": "/dev/nvme0", "type": "nvme", "protocol": "NVMe"}, "model_name": "Samsung SSD 980 PRO 1TB", "smart_status": {"passed": true}, "temperature": {"current": 41}, "power_on_time": {"hours": 5120}, "nvme_smart_health_information_log": {"critical_warning": 0, "temperature": 41, "percentage_used": 3, "media_errors": 0}}
